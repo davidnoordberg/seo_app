@@ -4,19 +4,19 @@ import requests
 import openai
 from flask import Flask, request, jsonify
 
-# === jouw originele instellingen, maar nu via env vars ===
+# === API keys uit environment variables (Render → Environment) ===
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
 
-# ======= JOUW ORIGINELE FUNCTIES (ongewijzigd, op 1 ding na: modelnaam blijft hetzelfde) =======
+# ======= Originele functies, kleine aanpassing voor variabel aantal vragen =======
 
-def genereer_zoekvragen(product, locatie):
+def genereer_zoekvragen(product, locatie, n=10):
     prompt = f"""
 Je bent een SEO-expert gespecialiseerd in AI-zoekgedrag. 
-Geef 10 natuurlijke vragen die iemand aan ChatGPT of Perplexity zou stellen
+Geef {n} natuurlijke vragen die iemand aan ChatGPT of Perplexity zou stellen
 wanneer ze op zoek zijn naar een {product} in {locatie}.
 
 ✅ Houd de vragen:
@@ -52,7 +52,7 @@ def vraag_perplexity(prompt):
     )
 
     payload = {
-        "model": "llama-3-70b-instruct",  # jouw originele keuze
+        "model": "llama-3-70b-instruct",
         "messages": [{"role": "user", "content": instructie + prompt}],
     }
 
@@ -64,7 +64,6 @@ def vraag_perplexity(prompt):
     )
 
     if response.status_code != 200:
-        # geen print meer in API, maar nette fallback
         return None
 
     try:
@@ -81,34 +80,37 @@ def check_bedrijfsvermelding(antwoord, bedrijfsnaam, domeinnaam=None):
     return naam_gevonden or domein_gevonden
 
 
-def run_vindbaarheidsscan(bedrijfsnaam, product, locatie, domeinnaam=None):
-    vragen = genereer_zoekvragen(product, locatie)
+def run_vindbaarheidsscan(bedrijfsnaam, product, locatie, domeinnaam=None, n=10):
+    vragen = genereer_zoekvragen(product, locatie, n=n)
     score = 0
 
     for vraag in vragen:
         antwoord = vraag_perplexity(vraag)
-        if not antwoord:
-            # sla deze over
-            continue
-        gevonden = check_bedrijfsvermelding(antwoord, bedrijfsnaam, domeinnaam)
-        if gevonden:
+        if antwoord and check_bedrijfsvermelding(antwoord, bedrijfsnaam, domeinnaam):
             score += 1
-        time.sleep(1.5)  # voorkom rate limiting
+        # Kortere sleep bij kleine n om sneller te initialiseren
+        time.sleep(0.6 if n <= 3 else 1.5)
 
     percentage = (score / max(len(vragen), 1)) * 100
     return round(percentage)
 
-# ======= KLEIN API-LAAGJE ERBIJ =======
+# ======= API endpoints =======
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    """Handige health check om Render wakker te maken."""
+    return "ok", 200
 
 @app.route("/scan", methods=["POST"])
 def scan_endpoint():
     """
-    Verwacht JSON body met:
+    Verwacht JSON body:
     {
       "company_name": "...",
       "product_service": "...",   (of "business_category")
       "location": "...",
-      "website_url": "https://..."
+      "website_url": "https://...",
+      "n": 3  # optioneel, aantal vragen
     }
     Retourneert: { "score": 72 }
     """
@@ -124,12 +126,17 @@ def scan_endpoint():
                    .lower()
     ) if website_url else None
 
+    try:
+        n = int(data.get("n", 10))
+    except ValueError:
+        n = 10
+
     if not (bedrijfsnaam and product and locatie):
         return jsonify({"error": "company_name, product_service (of business_category) en location zijn verplicht"}), 400
 
-    score = run_vindbaarheidsscan(bedrijfsnaam, product, locatie, domeinnaam)
+    score = run_vindbaarheidsscan(bedrijfsnaam, product, locatie, domeinnaam, n=n)
     return jsonify({"score": score})
 
 if __name__ == "__main__":
-    # lokaal draaien: python app.py
+    # Voor lokaal testen
     app.run(host="0.0.0.0", port=5000)
