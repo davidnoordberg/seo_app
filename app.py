@@ -11,7 +11,7 @@ PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
 
-# ======= Originele functies, kleine aanpassing voor variabel aantal vragen =======
+# ======= Functies (originele logica, alleen uitgebreid met variabel n) =======
 
 def genereer_zoekvragen(product, locatie, n=10):
     prompt = f"""
@@ -88,7 +88,7 @@ def run_vindbaarheidsscan(bedrijfsnaam, product, locatie, domeinnaam=None, n=10)
         antwoord = vraag_perplexity(vraag)
         if antwoord and check_bedrijfsvermelding(antwoord, bedrijfsnaam, domeinnaam):
             score += 1
-        # Kortere sleep bij kleine n om sneller te initialiseren
+        # Kortere wachttijd bij test-run met weinig vragen
         time.sleep(0.6 if n <= 3 else 1.5)
 
     percentage = (score / max(len(vragen), 1)) * 100
@@ -98,7 +98,7 @@ def run_vindbaarheidsscan(bedrijfsnaam, product, locatie, domeinnaam=None, n=10)
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    """Handige health check om Render wakker te maken."""
+    """Health check endpoint."""
     return "ok", 200
 
 @app.route("/scan", methods=["POST"])
@@ -110,7 +110,7 @@ def scan_endpoint():
       "product_service": "...",   (of "business_category")
       "location": "...",
       "website_url": "https://...",
-      "n": 3  # optioneel, aantal vragen
+      "n": 3   # optioneel, aantal zoekvragen
     }
     Retourneert: { "score": 72 }
     """
@@ -138,5 +138,5 @@ def scan_endpoint():
     return jsonify({"score": score})
 
 if __name__ == "__main__":
-    # Voor lokaal testen
+    # Lokaal draaien: python app.py
     app.run(host="0.0.0.0", port=5000)
