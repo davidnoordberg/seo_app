@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 # ---- Environment (Render) ----
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")  # eventueel via env instelbaar
 
 # OpenAI client
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -43,7 +44,7 @@ Omschrijving:
 """
 
     resp = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=OPENAI_MODEL,  # bv. gpt-4-turbo (default) of via env overschrijfbaar
         messages=[
             {"role": "system", "content": "Je bent een expert in gebruikerszoekgedrag en SEO."},
             {"role": "user", "content": prompt}
@@ -96,17 +97,33 @@ def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str |
     return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
 
-def run_vindbaarheidsscan(bedrijfsnaam: str, description: str, locatie: str, domeinnaam: str | None, n: int = 10) -> int:
+def run_vindbaarheidsscan(
+    bedrijfsnaam: str,
+    description: str,
+    locatie: str,
+    domeinnaam: str | None,
+    n: int = 10,
+    collect: bool = False
+):
+    """Als collect=True, retourneer (score, items) met Q&A."""
     vragen = genereer_zoekvragen(description, locatie, n=n)
     if not vragen:
-        return 0
+        return 0 if not collect else (0, [])
+
     hits = 0
+    items = []
+
     for vraag in vragen:
         antw = vraag_perplexity(vraag)
-        if antw and check_bedrijfsvermelding(antw, bedrijfsnaam, domeinnaam):
+        hit = bool(antw and check_bedrijfsvermelding(antw, bedrijfsnaam, domeinnaam))
+        if hit:
             hits += 1
+        if collect:
+            items.append({"q": vraag, "a": (antw or ""), "hit": hit})
         time.sleep(0.6 if n <= 3 else 1.5)  # rate limit
-    return round((hits / max(len(vragen), 1)) * 100)
+
+    score = round((hits / max(len(vragen), 1)) * 100)
+    return score if not collect else (score, items)
 
 
 # -------- API --------
@@ -124,15 +141,21 @@ def scan():
       "description": "...",
       "location": "...",
       "website_url": "https://...",
-      "n": 10
+      "n": 10,
+      "return_details": true   # optioneel; als meegegeven -> ook Q&A terug
     }
-    Returns: { "score": <number> }
+
+    Returns normal:
+      { "score": <number> }
+
+    Returns with details (when return_details / debug is true):
+      { "score": <number>, "items": [ { "q": "...", "a": "...", "hit": true } ] }
     """
     data = request.get_json(force=True) or {}
 
     bedrijfsnaam = (data.get("company_name") or "").strip()
-    description  = (data.get("description") or "").strip()
-    locatie      = (data.get("location") or "").strip()
+    description  = (data.get("description")  or "").strip()
+    locatie      = (data.get("location")    or "").strip()
     website_url  = (data.get("website_url") or "").strip()
 
     domein = (
@@ -145,13 +168,19 @@ def scan():
         n = 10
     n = max(1, min(n, 12))
 
+    return_details = bool(data.get("return_details") or data.get("debug"))
+
     if not (bedrijfsnaam and description and locatie):
         return jsonify({"error": "company_name, description en location zijn verplicht"}), 400
 
-    score = run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domein, n=n)
-    return jsonify({"score": score}), 200
+    if return_details:
+        score, items = run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domein, n=n, collect=True)
+        return jsonify({"score": score, "items": items}), 200
+    else:
+        score = run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domein, n=n, collect=False)
+        return jsonify({"score": score}), 200
 
 
 if __name__ == "__main__":
-    # Local dev — Render will use gunicorn
+    # Local dev — Render gebruikt gunicorn
     app.run(host="0.0.0.0", port=5000)
