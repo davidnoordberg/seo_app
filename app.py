@@ -68,7 +68,7 @@ def vraag_perplexity(prompt: str):
         "Noem alleen bedrijven, merknamen, locaties of domeinen. Geen uitleg.\n\n"
     )
     payload = {
-        "model": "llama-3-70b-instruct",
+        "model": "sonar",
         "messages": [{"role": "user", "content": instructie + prompt}],
     }
     try:
