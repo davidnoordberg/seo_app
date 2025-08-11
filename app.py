@@ -1,13 +1,18 @@
 import os
 import time
+import logging
 import requests
 import openai
 from flask import Flask, request, jsonify
 
+# ---- Logging (handig op Render) ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("scanapi")
+
 # ---- Environment (Render) ----
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")  # eventueel via env instelbaar
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")  # via env aanpasbaar
 
 # OpenAI client
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -43,14 +48,19 @@ Omschrijving:
 \"\"\"{description}\"\"\"
 """
 
-    resp = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,  # bv. gpt-4-turbo (default) of via env overschrijfbaar
-        messages=[
-            {"role": "system", "content": "Je bent een expert in gebruikerszoekgedrag en SEO."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    content = (resp.choices[0].message.content or "").strip()
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,  # bv. gpt-4-turbo (default) of via env overschrijfbaar
+            messages=[
+                {"role": "system", "content": "Je bent een expert in gebruikerszoekgedrag en SEO."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        content = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.exception("OpenAI-fout bij genereren vragen: %s", e)
+        return []
+
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
@@ -58,7 +68,11 @@ Omschrijving:
     return regels
 
 
-def vraag_perplexity(prompt: str):
+def vraag_perplexity(prompt: str, return_errors: bool = False):
+    """
+    Vraagt Perplexity. Bij succes: antwoordtekst.
+    Bij fout: None (of als return_errors=True een korte foutstring, zichtbaar in 'items').
+    """
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json"
@@ -78,16 +92,20 @@ def vraag_perplexity(prompt: str):
             json=payload,
             timeout=45
         )
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        log.warning("Perplexity netwerkfout: %s", e)
+        return f"__ERR network: {e}" if return_errors else None
 
     if r.status_code != 200:
-        return None
+        snippet = r.text[:180].replace("\n", " ")
+        log.info("Perplexity %s: %s", r.status_code, snippet)
+        return (f"__ERR {r.status_code}: {snippet}") if return_errors else None
 
     try:
         return r.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError):
-        return None
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning("Perplexity parse-fout: %s; body=%s", e, r.text[:200])
+        return f"__ERR parse: {e}" if return_errors else None
 
 
 def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str | None = None) -> bool:
@@ -114,13 +132,13 @@ def run_vindbaarheidsscan(
     items = []
 
     for vraag in vragen:
-        antw = vraag_perplexity(vraag)
+        antw = vraag_perplexity(vraag, return_errors=collect)
         hit = bool(antw and check_bedrijfsvermelding(antw, bedrijfsnaam, domeinnaam))
         if hit:
             hits += 1
         if collect:
             items.append({"q": vraag, "a": (antw or ""), "hit": hit})
-        time.sleep(0.6 if n <= 3 else 1.5)  # rate limit
+        time.sleep(0.6 if n <= 3 else 1.5)  # eenvoudige rate limiting
 
     score = round((hits / max(len(vragen), 1)) * 100)
     return score if not collect else (score, items)
@@ -152,6 +170,7 @@ def scan():
       { "score": <number>, "items": [ { "q": "...", "a": "...", "hit": true } ] }
     """
     data = request.get_json(force=True) or {}
+    log.info("DEBUG /scan incoming: %s", data)
 
     bedrijfsnaam = (data.get("company_name") or "").strip()
     description  = (data.get("description")  or "").strip()
@@ -170,8 +189,22 @@ def scan():
 
     return_details = bool(data.get("return_details") or data.get("debug"))
 
-    if not (bedrijfsnaam and description and locatie):
-        return jsonify({"error": "company_name, description en location zijn verplicht"}), 400
+    # Validate + duidelijke foutmelding
+    missing = []
+    if not bedrijfsnaam: missing.append("company_name")
+    if not description:  missing.append("description")
+    if not locatie:      missing.append("location")
+    if missing:
+        return jsonify({
+            "error": "missing required fields",
+            "missing": missing,
+            "received": {
+                "company_name": bedrijfsnaam,
+                "description": description,
+                "location": locatie,
+                "website_url": website_url
+            }
+        }), 400
 
     if return_details:
         score, items = run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domein, n=n, collect=True)
@@ -182,5 +215,5 @@ def scan():
 
 
 if __name__ == "__main__":
-    # Local dev — Render gebruikt gunicorn
+    # Local dev — Render gebruikt gunicorn in productie
     app.run(host="0.0.0.0", port=5000)
