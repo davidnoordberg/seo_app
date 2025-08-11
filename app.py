@@ -4,19 +4,18 @@ import requests
 import openai
 from flask import Flask, request, jsonify
 
-# API keys via Render environment variables
+# ---- Environment (Render) ----
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 
+# OpenAI client
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
 app = Flask(__name__)
 
-# ===== Zoekvragen generator =====
-def genereer_zoekvragen(description, locatie, n=10):
-    """
-    Gebruikt altijd de vrije omschrijving om kernbegrippen af te leiden
-    en genereert vervolgens {n} natuurlijke AI-zoekvragen.
-    """
+# -------- Helpers --------
+def genereer_zoekvragen(description: str, locatie: str, n: int = 10):
+    """Maak n natuurlijke AI-zoekvragen op basis van een vrije beschrijving."""
     try:
         n = int(n)
     except Exception:
@@ -43,24 +42,22 @@ Omschrijving:
 \"\"\"{description}\"\"\"
 """
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4-turbo",
+    resp = openai_client.chat.completions.create(
+        model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "Je bent een expert in gebruikerszoekgedrag en SEO."},
             {"role": "user", "content": prompt}
         ]
     )
+    content = (resp.choices[0].message.content or "").strip()
+    regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
+    if len(regels) > n:
+        met_vraagteken = [r for r in regels if "?" in r]
+        regels = (met_vraagteken or regels)[:n]
+    return regels
 
-    content = response.choices[0].message.content or ""
-    vragen = [regel.strip("-• ").strip() for regel in content.split("\n") if regel.strip()]
-    if len(vragen) > n:
-        kandidaten = [v for v in vragen if "?" in v]
-        vragen = (kandidaten or vragen)[:n]
-    return vragen
 
-
-# ===== Perplexity =====
-def vraag_perplexity(prompt):
+def vraag_perplexity(prompt: str):
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json"
@@ -74,7 +71,7 @@ def vraag_perplexity(prompt):
         "messages": [{"role": "user", "content": instructie + prompt}],
     }
     try:
-        response = requests.post(
+        r = requests.post(
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
             json=payload,
@@ -83,74 +80,78 @@ def vraag_perplexity(prompt):
     except requests.RequestException:
         return None
 
-    if response.status_code != 200:
+    if r.status_code != 200:
         return None
 
     try:
-        return response.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
+        return r.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, ValueError):
         return None
 
 
-def check_bedrijfsvermelding(antwoord, bedrijfsnaam, domeinnaam=None):
+def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str | None = None) -> bool:
     if not antwoord:
         return False
-    tekst = antwoord.lower()
-    return bedrijfsnaam.lower() in tekst or (domeinnaam and domeinnaam.lower() in tekst)
+    t = antwoord.lower()
+    return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
 
-def run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domeinnaam=None, n=10):
+def run_vindbaarheidsscan(bedrijfsnaam: str, description: str, locatie: str, domeinnaam: str | None, n: int = 10) -> int:
     vragen = genereer_zoekvragen(description, locatie, n=n)
     if not vragen:
         return 0
-
     hits = 0
     for vraag in vragen:
-        antwoord = vraag_perplexity(vraag)
-        if antwoord and check_bedrijfsvermelding(antwoord, bedrijfsnaam, domeinnaam):
+        antw = vraag_perplexity(vraag)
+        if antw and check_bedrijfsvermelding(antw, bedrijfsnaam, domeinnaam):
             hits += 1
-        time.sleep(0.6 if n <= 3 else 1.5)
-
+        time.sleep(0.6 if n <= 3 else 1.5)  # rate limit
     return round((hits / max(len(vragen), 1)) * 100)
 
 
-# ===== API =====
+# -------- API --------
 @app.route("/ping", methods=["GET"])
 def ping():
     return "ok", 200
 
 
 @app.route("/scan", methods=["POST"])
-def scan_endpoint():
+def scan():
     """
-    JSON body:
+    Expect JSON:
     {
       "company_name": "...",
       "description": "...",
       "location": "...",
       "website_url": "https://...",
-      "n": 2
+      "n": 10
     }
+    Returns: { "score": <number> }
     """
     data = request.get_json(force=True) or {}
+
     bedrijfsnaam = (data.get("company_name") or "").strip()
-    description = (data.get("description") or "").strip()
-    locatie = (data.get("location") or "").strip()
-    website_url = (data.get("website_url") or "").strip()
-    domeinnaam = (
+    description  = (data.get("description") or "").strip()
+    locatie      = (data.get("location") or "").strip()
+    website_url  = (data.get("website_url") or "").strip()
+
+    domein = (
         website_url.replace("https://", "").replace("http://", "").replace("/", "").lower()
     ) if website_url else None
+
     try:
         n = int(data.get("n", 10))
-    except ValueError:
+    except (TypeError, ValueError):
         n = 10
+    n = max(1, min(n, 12))
 
     if not (bedrijfsnaam and description and locatie):
         return jsonify({"error": "company_name, description en location zijn verplicht"}), 400
 
-    score = run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domeinnaam, n=n)
-    return jsonify({"score": score})
+    score = run_vindbaarheidsscan(bedrijfsnaam, description, locatie, domein, n=n)
+    return jsonify({"score": score}), 200
 
 
 if __name__ == "__main__":
+    # Local dev — Render will use gunicorn
     app.run(host="0.0.0.0", port=5000)
