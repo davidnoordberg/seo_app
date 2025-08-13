@@ -3,9 +3,9 @@ import time
 import logging
 import requests
 import openai
-import psycopg2
 from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
+from sqlalchemy import create_engine, text
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -16,9 +16,23 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 
-# Database
+# Database (gebruik je Internal URL op Render als DATABASE_URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-PGSSLMODE = os.environ.get("PGSSLMODE", "require")  # gebruik "disable" voor interne Render-DB
+
+def _adapt_url_for_sqlalchemy(url: str) -> str:
+    """
+    Maak van 'postgresql://user:pass@host/db' -> 'postgresql+pg8000://user:pass@host/db'
+    (of 'postgres://' -> 'postgresql+pg8000://...')
+    """
+    if not url:
+        return ""
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url.split("://", 1)[1]
+    if url.startswith("postgresql://"):
+        url = "postgresql+pg8000://" + url.split("://", 1)[1]
+    return url
+
+ENGINE = create_engine(_adapt_url_for_sqlalchemy(DATABASE_URL), pool_pre_ping=True) if DATABASE_URL else None
 
 # Tuning (kan via Render env worden overschreven)
 DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))     # max aantal vragen
@@ -52,22 +66,24 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
                     location: str | None, language: str | None, score: int) -> bool:
     """
     Slaat één rij op in tabel 'scans'. Returnt True bij succes, False bij skip/fout.
-    Vereist env: DATABASE_URL (postgresql://user:pass@host/db).
+    Vereist env: DATABASE_URL (Internal of External). Tabel 'scans' heb je al aangemaakt.
     """
-    if not DATABASE_URL:
-        log.info("DATABASE_URL ontbreekt; sla DB-write over.")
+    if not ENGINE:
+        log.info("DATABASE_URL ontbreekt of engine niet geconfigureerd; sla DB-write over.")
         return False
     try:
-        # psycopg2 accepteert direct de URL; sslmode kan je via PGSSLMODE sturen.
-        with psycopg2.connect(DATABASE_URL, sslmode=PGSSLMODE) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO scans (name, website_url, description, location, language, score)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (name, website_url or None, description or None, location or None, language or None, int(score)),
-                )
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO scans (name, website_url, description, location, language, score)
+                VALUES (:name, :website_url, :description, :location, :language, :score)
+            """), dict(
+                name=name,
+                website_url=website_url or None,
+                description=description or None,
+                location=location or None,
+                language=language or None,
+                score=int(score),
+            ))
         return True
     except Exception as e:
         log.exception("DB insert failed: %s", e)
