@@ -63,7 +63,8 @@ CORS(app, resources={
 
 # ---------- DB helper ----------
 def save_scan_to_db(name: str, website_url: str | None, description: str | None,
-                    location: str | None, language: str | None, score: int) -> bool:
+                    location: str | None, language: str | None, score: int,
+                    email: str | None = None) -> bool:
     """
     Slaat één rij op in tabel 'scans'. Returnt True bij succes, False bij skip/fout.
     Vereist env: DATABASE_URL (Internal of External). Tabel 'scans' heb je al aangemaakt.
@@ -74,8 +75,8 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
     try:
         with ENGINE.begin() as conn:
             conn.execute(text("""
-                INSERT INTO scans (name, website_url, description, location, language, score)
-                VALUES (:name, :website_url, :description, :location, :language, :score)
+                INSERT INTO scans (name, website_url, description, location, language, score, email)
+                VALUES (:name, :website_url, :description, :location, :language, :score, :email)
             """), dict(
                 name=name,
                 website_url=website_url or None,
@@ -83,6 +84,7 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
                 location=location or None,
                 language=language or None,
                 score=int(score),
+                email=email or None
             ))
         return True
     except Exception as e:
@@ -152,7 +154,7 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "sonar",  # evt. 'sonar-small-chat' voor nog iets sneller/goedkoper
+        "model": "sonar",
         "messages": [{
             "role": "user",
             "content": (
@@ -162,7 +164,6 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         }],
     }
     try:
-        # tuple timeout: (connect_timeout, read_timeout)
         r = requests.post(
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
@@ -222,7 +223,6 @@ def run_vindbaarheidsscan(
     processed = 0
 
     for vraag in vragen:
-        # Respecteer totaalbudget
         if time.time() - start_ts > MAX_SCAN_SECONDS:
             log.info("Time budget reached; stopping early after %d/%d vragen", processed, len(vragen))
             break
@@ -236,7 +236,7 @@ def run_vindbaarheidsscan(
         if collect:
             items.append({"q": vraag, "a": (antw or ""), "hit": hit})
 
-        time.sleep(SLEEP_FAST)  # kleine pauze i.v.m. rate-limits
+        time.sleep(SLEEP_FAST)
 
     total = max(processed, 1)
     score = round((hits / total) * 100)
@@ -261,11 +261,9 @@ def ping():
     allow_headers=["Content-Type"],
 )
 def scan():
-    # Preflight (CORS)
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # JSON of form-encoded accepteren
     data = (request.get_json(silent=True) or request.form.to_dict() or {})
     log.info("DEBUG /scan incoming: %s", data)
 
@@ -274,6 +272,7 @@ def scan():
     locatie      = (data.get("location")    or "").strip()
     website_url  = (data.get("website_url") or "").strip()
     language     = (data.get("language")    or "").strip() or None
+    email        = (data.get("email")       or "").strip() or None
 
     domein = (
         website_url.replace("https://", "").replace("http://", "").replace("/", "").lower()
@@ -287,7 +286,6 @@ def scan():
 
     return_details = bool(data.get("return_details") or data.get("debug"))
 
-    # Validate
     missing = []
     if not bedrijfsnaam: missing.append("company_name")
     if not description:  missing.append("description")
@@ -300,7 +298,8 @@ def scan():
                 "company_name": bedrijfsnaam,
                 "description": description,
                 "location": locatie,
-                "website_url": website_url
+                "website_url": website_url,
+                "email": email
             }
         }), 400
 
@@ -308,18 +307,15 @@ def scan():
         score, items = run_vindbaarheidsscan(
             bedrijfsnaam, description, locatie, domein, n=n, collect=True, language=language
         )
-        # Opslaan in DB
-        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score)
+        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
         return jsonify({"score": score, "items": items}), 200
     else:
         score = run_vindbaarheidsscan(
             bedrijfsnaam, description, locatie, domein, n=n, collect=False, language=language
         )
-        # Opslaan in DB
-        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score)
+        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
         return jsonify({"score": score}), 200
 
 
 if __name__ == "__main__":
-    # Local dev — Render gebruikt gunicorn in productie
     app.run(host="0.0.0.0", port=5000)
