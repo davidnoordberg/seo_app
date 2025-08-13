@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import re
 import requests
 import openai
 from flask import Flask, request, jsonify
@@ -8,7 +9,8 @@ from flask_cors import CORS, cross_origin
 from sqlalchemy import create_engine, text
 
 # ---------------- Logging ----------------
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("scanapi")
 
 # ---------------- Environment ----------------
@@ -16,13 +18,13 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 
-# Database (gebruik je Internal URL op Render als DATABASE_URL)
+# Database (Render Internal/External URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 def _adapt_url_for_sqlalchemy(url: str) -> str:
     """
-    Maak van 'postgresql://user:pass@host/db' -> 'postgresql+pg8000://user:pass@host/db'
-    (of 'postgres://' -> 'postgresql+pg8000://...')
+    Turn 'postgresql://user:pass@host/db' -> 'postgresql+pg8000://user:pass@host/db'
+    (and 'postgres://...' -> 'postgresql+pg8000://...')
     """
     if not url:
         return ""
@@ -34,13 +36,13 @@ def _adapt_url_for_sqlalchemy(url: str) -> str:
 
 ENGINE = create_engine(_adapt_url_for_sqlalchemy(DATABASE_URL), pool_pre_ping=True) if DATABASE_URL else None
 
-# Tuning (kan via Render env worden overschreven)
-DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))     # max aantal vragen
-MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300")) # totaal budget (5 min)
-PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))  # read-timeout per call
-SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))     # kleine pauze tussen calls
+# Tuning (overridable via env)
+DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))      # max questions
+MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300"))  # total budget (5 min)
+PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))
+SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))
 
-# Toegestane origins voor CORS (komma-gescheiden)
+# CORS
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://aseo-70fee3.webflow.io").split(",")
     if o.strip()
@@ -51,13 +53,14 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 app = Flask(__name__)
 
-# CORS (globaal + specifiek /scan)
+# CORS (global + explicit /scan & /scans)
 CORS(app, resources={
     r"/scan": {
         "origins": ALLOWED_ORIGINS or ["*"],
         "methods": ["POST", "OPTIONS"],
         "allow_headers": ["Content-Type"],
     },
+    r"/scans": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["GET"]},
     r"/ping": {"origins": "*"},
 })
 
@@ -66,11 +69,10 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
                     location: str | None, language: str | None, score: int,
                     email: str | None) -> bool:
     """
-    Slaat één rij op in tabel 'scans'. Returnt True bij succes, False bij skip/fout.
-    Vereist env: DATABASE_URL (Internal of External). Tabel 'scans' heb je al aangemaakt.
+    Insert one row into 'scans' table. Returns True on success.
     """
     if not ENGINE:
-        log.info("DATABASE_URL ontbreekt of engine niet geconfigureerd; sla DB-write over.")
+        log.info("DATABASE_URL missing / engine not configured; skipping DB write.")
         return False
     try:
         with ENGINE.begin() as conn:
@@ -91,9 +93,55 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
         log.exception("DB insert failed: %s", e)
         return False
 
-# --------------- Helpers ----------------
+# ---------------- Parse & validate helpers ----------------
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+def _normalize_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    u = url.strip()
+    if not u:
+        return None
+    if not u.lower().startswith(("http://", "https://")):
+        u = "https://" + u
+    return u
+
+def parse_scan_request(req) -> dict:
+    """
+    Accept JSON or form-encoded bodies and tolerate common Webflow name variants.
+    """
+    data = (req.get_json(silent=True) or {})
+    if not data and req.form:
+        data = req.form.to_dict(flat=True)
+
+    def g(key, *alts, default=""):
+        for k in (key, *alts):
+            if k in data:
+                v = data.get(k)
+                if isinstance(v, str):
+                    v = v.strip()
+                return v
+        return default
+
+    payload = {
+        "company_name": g("company_name"),
+        "website_url":  _normalize_url(g("website_url")),
+        "description":  g("description"),
+        "location":     g("location"),
+        "language":     (g("language") or "en").lower(),
+        # Be forgiving about field names coming from Webflow
+        "email":        g("email", "Email", "email_address", "Email-2"),
+        "n":            int(g("n", default=DEFAULT_MAX_N) or DEFAULT_MAX_N),
+        "return_details": str(g("return_details", "debug", default="")).lower() in ("1","true","yes","on")
+    }
+
+    # Clamp n
+    payload["n"] = max(1, min(payload["n"], DEFAULT_MAX_N))
+    return payload
+
+# --------------- Scan logic ----------------
 def genereer_zoekvragen(description: str, locatie: str, n: int = 10, language: str | None = None):
-    """Maak n natuurlijke AI-zoekvragen op basis van de beschrijving."""
+    """Create n natural AI-search questions based on a short business description."""
     try:
         n = int(n)
     except Exception:
@@ -134,31 +182,26 @@ Omschrijving:
         )
         content = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        log.exception("OpenAI-fout bij genereren vragen: %s", e)
+        log.exception("OpenAI error while generating questions: %s", e)
         return []
 
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
-        # --- FIX: geen parser-gedoe, gewoon expliciet kiezen ---
-        if met_vraagteken:
-            regels = met_vraagteken[:n]
-        else:
-            regels = regels[:n]
+        regels = (met_vraagteken or regels)[:n]
     return regels
-
 
 def vraag_perplexity(prompt: str, return_errors: bool = False):
     """
-    Vraagt Perplexity. Bij succes: antwoordtekst.
-    Bij fout: None (of als return_errors=True een korte foutstring, zichtbaar in 'items').
+    Call Perplexity. On success: answer text.
+    On failure: None (or error marker when return_errors=True).
     """
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "sonar",  # evt. 'sonar-small-chat' voor nog iets sneller/goedkoper
+        "model": "sonar",
         "messages": [{
             "role": "user",
             "content": (
@@ -168,7 +211,6 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         }],
     }
     try:
-        # tuple timeout: (connect_timeout, read_timeout)
         r = requests.post(
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
@@ -179,7 +221,7 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         log.warning("Perplexity timeout")
         return "__ERR timeout" if return_errors else None
     except requests.RequestException as e:
-        log.warning("Perplexity netwerkfout: %s", e)
+        log.warning("Perplexity network error: %s", e)
         return (f"__ERR network: {e}") if return_errors else None
 
     if r.status_code != 200:
@@ -190,17 +232,14 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
     try:
         return r.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError) as e:
-        log.warning("Perplexity parse-fout: %s; body=%s", e, r.text[:200])
+        log.warning("Perplexity parse error: %s; body=%s", e, r.text[:200])
         return (f"__ERR parse: {e}") if return_errors else None
-
 
 def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str | None = None) -> bool:
     if not antwoord:
         return False
     t = antwoord.lower()
-    # --- FIX: Python gebruikt 'and', niet 'en'
     return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
-
 
 def run_vindbaarheidsscan(
     bedrijfsnaam: str,
@@ -211,7 +250,7 @@ def run_vindbaarheidsscan(
     collect: bool = False,
     language: str | None = None,
 ):
-    """Als collect=True, retourneer (score, items) met Q&A."""
+    """If collect=True, return (score, items) with Q&A details."""
     try:
         n = int(n)
     except Exception:
@@ -229,9 +268,8 @@ def run_vindbaarheidsscan(
     processed = 0
 
     for vraag in vragen:
-        # Respecteer totaalbudget
         if time.time() - start_ts > MAX_SCAN_SECONDS:
-            log.info("Time budget reached; stopping early after %d/%d vragen", processed, len(vragen))
+            log.info("Time budget reached; stopping early after %d/%d questions", processed, len(vragen))
             break
 
         antw = vraag_perplexity(vraag, return_errors=collect)
@@ -243,23 +281,20 @@ def run_vindbaarheidsscan(
         if collect:
             items.append({"q": vraag, "a": (antw or ""), "hit": hit})
 
-        time.sleep(SLEEP_FAST)  # kleine pauze i.v.m. rate-limits
+        time.sleep(SLEEP_FAST)
 
     total = max(processed, 1)
     score = round((hits / total) * 100)
     return score if not collect else (score, items)
-
 
 # --------------- API ----------------
 @app.route("/", methods=["GET"])
 def root():
     return "scanner up", 200
 
-
 @app.route("/ping", methods=["GET"])
 def ping():
     return "ok", 200
-
 
 @app.route("/scan", methods=["POST", "OPTIONS"])
 @cross_origin(
@@ -272,81 +307,62 @@ def scan():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # JSON of form-encoded accepteren
-    data = (request.get_json(silent=True) or request.form.to_dict() or {})
-    log.info("DEBUG /scan incoming: %s", data)
+    # Deep debug (enable with LOG_LEVEL=DEBUG)
+    log.debug("HEADERS=%s", dict(request.headers))
+    log.debug("RAW=%s | FORM=%s | JSON=%s",
+              request.get_data(as_text=True),
+              request.form.to_dict(),
+              request.get_json(silent=True))
 
-    bedrijfsnaam = (data.get("company_name") or "").strip()
-    description  = (data.get("description")  or "").strip()
-    locatie      = (data.get("location")    or "").strip()
-    website_url  = (data.get("website_url") or "").strip()
-    email        = (data.get("email")       or "").strip() or None
-    language     = (data.get("language")    or "").strip() or None
+    payload = parse_scan_request(request)
+    log.info("DEBUG /scan incoming (normalized): %s", payload)
 
-    domein = (
-        website_url.replace("https://", "").replace("http://", "").replace("/", "").lower()
-    ) if website_url else None
-
-    try:
-        n = int(data.get("n", DEFAULT_MAX_N))
-    except (TypeError, ValueError):
-        n = DEFAULT_MAX_N
-    n = max(1, min(n, DEFAULT_MAX_N))
-
-    return_details = bool(data.get("return_details") or data.get("debug"))
-
-    # Validate
-    missing = []
-    if not bedrijfsnaam: missing.append("company_name")
-    if not description:  missing.append("description")
-    if not locatie:      missing.append("location")
-    if not email:        missing.append("email")
+    # Validate with clear messages
+    missing = [k for k in ("company_name", "description", "location", "email") if not payload.get(k)]
     if missing:
-        return jsonify({
-            "error": "missing required fields",
-            "missing": missing,
-            "received": {
-                "company_name": bedrijfsnaam,
-                "description": description,
-                "location": locatie,
-                "website_url": website_url,
-                "email": email
-            }
-        }), 400
+        return jsonify({"error": f"Missing required field(s): {', '.join(missing)}"}), 400
 
-    if return_details:
+    if not EMAIL_RE.match(payload["email"]):
+        return jsonify({"error": "Invalid email format"}), 400
+
+    domein = None
+    if payload["website_url"]:
+        domein = payload["website_url"].replace("https://", "").replace("http://", "").split("/")[0].lower()
+
+    if payload["return_details"]:
         score, items = run_vindbaarheidsscan(
-            bedrijfsnaam, description, locatie, domein, n=n, collect=True, language=language
+            payload["company_name"], payload["description"], payload["location"],
+            domein, n=payload["n"], collect=True, language=payload["language"]
         )
-        # Opslaan in DB (met email)
-        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
+        save_scan_to_db(payload["company_name"], payload["website_url"], payload["description"],
+                        payload["location"], payload["language"], score, payload["email"])
         return jsonify({"score": score, "items": items}), 200
     else:
         score = run_vindbaarheidsscan(
-            bedrijfsnaam, description, locatie, domein, n=n, collect=False, language=language
+            payload["company_name"], payload["description"], payload["location"],
+            domein, n=payload["n"], collect=False, language=payload["language"]
         )
-        # Opslaan in DB (met email)
-        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
+        save_scan_to_db(payload["company_name"], payload["website_url"], payload["description"],
+                        payload["location"], payload["language"], score, payload["email"])
         return jsonify({"score": score}), 200
-
 
 @app.route("/scans", methods=["GET"])
 def list_scans():
-    """Geef alle scans terug als JSON."""
+    """Return all scans as JSON."""
     if not ENGINE:
-        return jsonify({"error": "Database niet geconfigureerd"}), 500
+        return jsonify({"error": "Database not configured"}), 500
     try:
         with ENGINE.connect() as conn:
             result = conn.execute(text(
-                "SELECT id, created_at, name, website_url, description, location, language, score, email FROM scans ORDER BY created_at DESC"
+                "SELECT id, created_at, name, website_url, description, location, language, score, email "
+                "FROM scans ORDER BY created_at DESC"
             ))
             rows = [dict(r) for r in result.mappings()]
         return jsonify(rows), 200
     except Exception as e:
-        log.exception("Fout bij ophalen scans: %s", e)
+        log.exception("DB query failed: %s", e)
         return jsonify({"error": "DB query failed"}), 500
 
-
 if __name__ == "__main__":
-    # Local dev — Render gebruikt gunicorn in productie
+    # Local dev — Render uses gunicorn in production
     app.run(host="0.0.0.0", port=5000)
