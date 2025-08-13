@@ -140,7 +140,11 @@ Omschrijving:
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
-        regels = (met_vraagteken of regels)[:n]
+        # --- FIX: geen parser-gedoe, gewoon expliciet kiezen ---
+        if met_vraagteken:
+            regels = met_vraagteken[:n]
+        else:
+            regels = regels[:n]
     return regels
 
 
@@ -194,7 +198,8 @@ def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str |
     if not antwoord:
         return False
     t = antwoord.lower()
-    return (bedrijfsnaam en bedrijfsnaam.lower() in t) or (domeinnaam en domeinnaam.lower() in t)
+    # --- FIX: Python gebruikt 'and', niet 'en'
+    return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
 
 def run_vindbaarheidsscan(
