@@ -15,7 +15,13 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 
-# Toegestane origins voor CORS (komma-gescheiden). Zet in Render bv.:
+# Tuning (kan via Render env worden overschreven)
+DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))   # max aantal vragen
+MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300"))  # totaal budget (5 min)
+PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))  # read-timeout per call
+SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))    # kleine pauze tussen calls
+
+# Toegestane origins voor CORS (komma-gescheiden), bv:
 # ALLOWED_ORIGINS="https://aseo-70fee3.webflow.io,https://jouwdomein.com"
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://aseo-70fee3.webflow.io").split(",")
@@ -43,8 +49,8 @@ def genereer_zoekvragen(description: str, locatie: str, n: int = 10, language: s
     try:
         n = int(n)
     except Exception:
-        n = 10
-    n = max(1, min(n, 12))
+        n = DEFAULT_MAX_N
+    n = max(1, min(n, DEFAULT_MAX_N))
 
     lang_hint = ""
     if language:
@@ -99,24 +105,30 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json",
     }
-    instructie = (
-        "Beantwoord de volgende vraag kort en concreet, in maximaal 3 zinnen. "
-        "Noem alleen bedrijven, merknamen, locaties of domeinen. Geen uitleg.\n\n"
-    )
     payload = {
-        "model": "sonar",
-        "messages": [{"role": "user", "content": instructie + prompt}],
+        "model": "sonar",  # evt. 'sonar-small-chat' voor nog iets sneller/goedkoper
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Beantwoord de volgende vraag kort en concreet, in maximaal 3 zinnen. "
+                "Noem alleen bedrijven, merknamen, locaties of domeinen. Geen uitleg.\n\n" + prompt
+            )
+        }],
     }
     try:
+        # tuple timeout: (connect_timeout, read_timeout)
         r = requests.post(
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
             json=payload,
-            timeout=45,
+            timeout=(10, PERPLEXITY_HTTP_TIMEOUT),
         )
+    except requests.Timeout:
+        log.warning("Perplexity timeout")
+        return "__ERR timeout" if return_errors else None
     except requests.RequestException as e:
         log.warning("Perplexity netwerkfout: %s", e)
-        return f"__ERR network: {e}" if return_errors else None
+        return (f"__ERR network: {e}") if return_errors else None
 
     if r.status_code != 200:
         snippet = r.text[:180].replace("\n", " ")
@@ -127,7 +139,7 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         return r.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError) as e:
         log.warning("Perplexity parse-fout: %s; body=%s", e, r.text[:200])
-        return f"__ERR parse: {e}" if return_errors else None
+        return (f"__ERR parse: {e}") if return_errors else None
 
 
 def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str | None = None) -> bool:
@@ -147,23 +159,41 @@ def run_vindbaarheidsscan(
     language: str | None = None,
 ):
     """Als collect=True, retourneer (score, items) met Q&A."""
+    try:
+        n = int(n)
+    except Exception:
+        n = DEFAULT_MAX_N
+    n = max(1, min(n, DEFAULT_MAX_N))
+
+    start_ts = time.time()
+
     vragen = genereer_zoekvragen(description, locatie, n=n, language=language)
     if not vragen:
         return 0 if not collect else (0, [])
 
     hits = 0
     items = []
+    processed = 0
 
     for vraag in vragen:
+        # Respecteer totaalbudget (5 min standaard)
+        if time.time() - start_ts > MAX_SCAN_SECONDS:
+            log.info("Time budget reached; stopping early after %d/%d vragen", processed, len(vragen))
+            break
+
         antw = vraag_perplexity(vraag, return_errors=collect)
+        processed += 1
+
         hit = bool(antw and check_bedrijfsvermelding(antw, bedrijfsnaam, domeinnaam))
         if hit:
             hits += 1
         if collect:
             items.append({"q": vraag, "a": (antw or ""), "hit": hit})
-        time.sleep(0.6 if n <= 3 else 1.5)  # eenvoudige rate limiting
 
-    score = round((hits / max(len(vragen), 1)) * 100)
+        time.sleep(SLEEP_FAST)  # kleine pauze om rate-limits te respecteren
+
+    total = max(processed, 1)
+    score = round((hits / total) * 100)
     return score if not collect else (score, items)
 
 
@@ -204,10 +234,10 @@ def scan():
     ) if website_url else None
 
     try:
-        n = int(data.get("n", 10))
+        n = int(data.get("n", DEFAULT_MAX_N))
     except (TypeError, ValueError):
-        n = 10
-    n = max(1, min(n, 12))
+        n = DEFAULT_MAX_N
+    n = max(1, min(n, DEFAULT_MAX_N))
 
     return_details = bool(data.get("return_details") or data.get("debug"))
 
