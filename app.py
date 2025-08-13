@@ -3,6 +3,7 @@ import time
 import logging
 import requests
 import openai
+import psycopg2
 from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
 
@@ -15,14 +16,17 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 
-# Tuning (kan via Render env worden overschreven)
-DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))   # max aantal vragen
-MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300"))  # totaal budget (5 min)
-PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))  # read-timeout per call
-SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))    # kleine pauze tussen calls
+# Database
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+PGSSLMODE = os.environ.get("PGSSLMODE", "require")  # gebruik "disable" voor interne Render-DB
 
-# Toegestane origins voor CORS (komma-gescheiden), bv:
-# ALLOWED_ORIGINS="https://aseo-70fee3.webflow.io,https://jouwdomein.com"
+# Tuning (kan via Render env worden overschreven)
+DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))     # max aantal vragen
+MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300")) # totaal budget (5 min)
+PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))  # read-timeout per call
+SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))     # kleine pauze tussen calls
+
+# Toegestane origins voor CORS (komma-gescheiden)
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://aseo-70fee3.webflow.io").split(",")
     if o.strip()
@@ -42,6 +46,32 @@ CORS(app, resources={
     },
     r"/ping": {"origins": "*"},
 })
+
+# ---------- DB helper ----------
+def save_scan_to_db(name: str, website_url: str | None, description: str | None,
+                    location: str | None, language: str | None, score: int) -> bool:
+    """
+    Slaat één rij op in tabel 'scans'. Returnt True bij succes, False bij skip/fout.
+    Vereist env: DATABASE_URL (postgresql://user:pass@host/db).
+    """
+    if not DATABASE_URL:
+        log.info("DATABASE_URL ontbreekt; sla DB-write over.")
+        return False
+    try:
+        # psycopg2 accepteert direct de URL; sslmode kan je via PGSSLMODE sturen.
+        with psycopg2.connect(DATABASE_URL, sslmode=PGSSLMODE) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO scans (name, website_url, description, location, language, score)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (name, website_url or None, description or None, location or None, language or None, int(score)),
+                )
+        return True
+    except Exception as e:
+        log.exception("DB insert failed: %s", e)
+        return False
 
 # --------------- Helpers ----------------
 def genereer_zoekvragen(description: str, locatie: str, n: int = 10, language: str | None = None):
@@ -176,7 +206,7 @@ def run_vindbaarheidsscan(
     processed = 0
 
     for vraag in vragen:
-        # Respecteer totaalbudget (5 min standaard)
+        # Respecteer totaalbudget
         if time.time() - start_ts > MAX_SCAN_SECONDS:
             log.info("Time budget reached; stopping early after %d/%d vragen", processed, len(vragen))
             break
@@ -190,7 +220,7 @@ def run_vindbaarheidsscan(
         if collect:
             items.append({"q": vraag, "a": (antw or ""), "hit": hit})
 
-        time.sleep(SLEEP_FAST)  # kleine pauze om rate-limits te respecteren
+        time.sleep(SLEEP_FAST)  # kleine pauze i.v.m. rate-limits
 
     total = max(processed, 1)
     score = round((hits / total) * 100)
@@ -215,7 +245,7 @@ def ping():
     allow_headers=["Content-Type"],
 )
 def scan():
-    # Preflight (CORS) — decorator zet de juiste headers
+    # Preflight (CORS)
     if request.method == "OPTIONS":
         return ("", 204)
 
@@ -262,11 +292,15 @@ def scan():
         score, items = run_vindbaarheidsscan(
             bedrijfsnaam, description, locatie, domein, n=n, collect=True, language=language
         )
+        # Opslaan in DB
+        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score)
         return jsonify({"score": score, "items": items}), 200
     else:
         score = run_vindbaarheidsscan(
             bedrijfsnaam, description, locatie, domein, n=n, collect=False, language=language
         )
+        # Opslaan in DB
+        save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score)
         return jsonify({"score": score}), 200
 
 
