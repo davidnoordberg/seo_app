@@ -3,6 +3,10 @@ import time
 import logging
 import requests
 import openai
+import smtplib
+from email.mime.text import MIMEText
+from email.utils import formataddr
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
 from sqlalchemy import create_engine, text
@@ -16,11 +20,18 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 
-# ➕ reCAPTCHA secret (nieuw)
+# reCAPTCHA secret
 RECAPTCHA_SECRET = os.environ.get("RECAPTCHA_SECRET", "").strip()
 
 # Database (gebruik je Internal URL op Render als DATABASE_URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+# SMTP / contact
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.zoho.eu")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "info@aseon.io")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+CONTACT_TO = os.environ.get("CONTACT_TO", "info@aseon.io")
 
 def _adapt_url_for_sqlalchemy(url: str) -> str:
     """
@@ -54,9 +65,14 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 app = Flask(__name__)
 
-# CORS (globaal + specifiek /scan)
+# CORS (globaal + specifiek /scan en /contact)
 CORS(app, resources={
     r"/scan": {
+        "origins": ALLOWED_ORIGINS or ["*"],
+        "methods": ["POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"],
+    },
+    r"/contact": {
         "origins": ALLOWED_ORIGINS or ["*"],
         "methods": ["POST", "OPTIONS"],
         "allow_headers": ["Content-Type"],
@@ -201,7 +217,7 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "sonar",  # evt. 'sonar-small-chat' voor nog iets sneller/goedkoper
+        "model": "sonar",
         "messages": [{
             "role": "user",
             "content": (
@@ -211,7 +227,6 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         }],
     }
     try:
-        # tuple timeout: (connect_timeout, read_timeout)
         r = requests.post(
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
@@ -286,7 +301,7 @@ def run_vindbaarheidsscan(
         if collect:
             items.append({"q": vraag, "a": (antw or ""), "hit": hit})
 
-        time.sleep(SLEEP_FAST)  # kleine pauze i.v.m. rate-limits
+        time.sleep(SLEEP_FAST)
 
     total = max(processed, 1)
     score = round((hits / total) * 100)
@@ -373,14 +388,12 @@ def scan():
         score, items = run_vindbaarheidsscan(
             bedrijfsnaam, description, locatie, domein, n=n, collect=True, language=language, biz_type=biz_type
         )
-        # Opslaan in DB (met email)
         save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
         return jsonify({"score": score, "items": items}), 200
     else:
         score = run_vindbaarheidsscan(
             bedrijfsnaam, description, locatie, domein, n=n, collect=False, language=language, biz_type=biz_type
         )
-        # Opslaan in DB (met email)
         save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
         return jsonify({"score": score}), 200
 
@@ -400,6 +413,63 @@ def list_scans():
     except Exception as e:
         log.exception("Fout bij ophalen scans: %s", e)
         return jsonify({"error": "DB query failed"}), 500
+
+
+# --------------- CONTACT: mail via Zoho SMTP ---------------
+def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None):
+    if not (SMTP_USER and SMTP_PASS):
+        raise RuntimeError("SMTP credentials missing")
+    msg = MIMEText(html_body, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("ASEO Contact", SMTP_USER))
+    msg["To"] = CONTACT_TO
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(SMTP_USER, [CONTACT_TO], msg.as_string())
+
+@app.route("/contact", methods=["POST", "OPTIONS"])
+@cross_origin(
+    origins=ALLOWED_ORIGINS or ["*"],
+    methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
+def contact():
+    # Preflight
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = (request.get_json(silent=True) or {})
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    message = (data.get("message") or "").strip()
+
+    if not (name and email and message):
+        return jsonify({"error": "missing fields"}), 400
+
+    # (Optioneel) reCAPTCHA voor contact:
+    # token = (data.get("recaptcha_token") or "").strip()
+    # if not token: return jsonify({"error": "missing recaptcha_token"}), 400
+    # ok,_ = verify_recaptcha(token, request.headers.get("X-Forwarded-For", request.remote_addr))
+    # if not ok: return jsonify({"error": "failed_recaptcha"}), 403
+
+    subj = f"New contact form message from {name}"
+    body = f"""
+      <h3>New contact message</h3>
+      <p><strong>Name:</strong> {name}<br>
+         <strong>Email:</strong> {email}</p>
+      <p style="white-space:pre-wrap">{message}</p>
+      <hr><p>Sent from aseon.io/contact</p>
+    """
+
+    try:
+        send_mail_via_zoho(subj, body, reply_to=email)
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        log.exception("contact send failed: %s", e)
+        return jsonify({"error": "email_failed"}), 500
 
 
 if __name__ == "__main__":
