@@ -16,6 +16,9 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 
+# ➕ reCAPTCHA secret (nieuw)
+RECAPTCHA_SECRET = os.environ.get("RECAPTCHA_SECRET", "").strip()
+
 # Database (gebruik je Internal URL op Render als DATABASE_URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
@@ -91,6 +94,27 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
         log.exception("DB insert failed: %s", e)
         return False
 
+# --------------- reCAPTCHA helper ---------------
+def verify_recaptcha(token: str, remote_ip: str | None = None):
+    """Valideer reCAPTCHA v2 token server-side. Return (ok: bool, details: dict/str)"""
+    if not RECAPTCHA_SECRET:
+        return False, {"error": "server_misconfigured: missing RECAPTCHA_SECRET"}
+    try:
+        r = requests.post(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data={
+                "secret": RECAPTCHA_SECRET,
+                "response": token,
+                "remoteip": remote_ip or "",
+            },
+            timeout=10,
+        )
+        j = r.json()
+        return bool(j.get("success")), j
+    except requests.RequestException as e:
+        log.exception("reCAPTCHA verify error: %s", e)
+        return False, {"error": "network_error"}
+
 # --------------- Helpers ----------------
 def genereer_zoekvragen(description: str, locatie: str, n: int = 10,
                          language: str | None = None, biz_type: str | None = None):
@@ -132,7 +156,7 @@ def genereer_zoekvragen(description: str, locatie: str, n: int = 10,
             f"\n• Waar kan ik [product] kopen in {locatie}?"
         )
 
-    prompt = f"""
+    prompt = f'''
 Je bent een SEO-expert in AI-zoekgedrag.
 
 Opdracht:
@@ -144,8 +168,8 @@ Opdracht:
 {examples}
 
 Omschrijving:
-\"\"\"{description}\"\"\"
-""".strip()
+"""{description}"""
+'''.strip()
 
     try:
         resp = openai_client.chat.completions.create(
@@ -295,6 +319,16 @@ def scan():
     data = (request.get_json(silent=True) or request.form.to_dict() or {})
     log.info("DEBUG /scan incoming: %s", data)
 
+    # ✅ reCAPTCHA: verplicht token + verificatie vóór verdere verwerking
+    recaptcha_token = (data.get("recaptcha_token") or "").strip()
+    if not recaptcha_token:
+        return jsonify({"error": "missing recaptcha_token"}), 400
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ok, details = verify_recaptcha(recaptcha_token, client_ip)
+    if not ok:
+        return jsonify({"error": "failed_recaptcha", "details": details}), 403
+
     bedrijfsnaam = (data.get("company_name") or "").strip()
     description  = (data.get("description")  or "").strip()
     locatie      = (data.get("location")    or "").strip()
@@ -315,7 +349,7 @@ def scan():
 
     return_details = bool(data.get("return_details") or data.get("debug"))
 
-    # Validate
+    # Validate overige velden
     missing = []
     if not bedrijfsnaam: missing.append("company_name")
     if not description:  missing.append("description")
