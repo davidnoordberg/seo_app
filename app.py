@@ -92,33 +92,56 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
         return False
 
 # --------------- Helpers ----------------
-def genereer_zoekvragen(description: str, locatie: str, n: int = 10, language: str | None = None):
-    """Maak n natuurlijke AI-zoekvragen op basis van de beschrijving."""
+def genereer_zoekvragen(description: str, locatie: str, n: int = 10,
+                         language: str | None = None, biz_type: str | None = None):
+    """
+    Genereer n natuurlijke AI-zoekvragen.
+      - online  : land/regio-focus, geen stad/‘near me’
+      - physical: lokaal zoeken (stad/regio toegestaan)
+    """
     try:
         n = int(n)
     except Exception:
         n = DEFAULT_MAX_N
     n = max(1, min(n, DEFAULT_MAX_N))
 
-    lang_hint = ""
-    if language:
-        lang_hint = f"\nSchrijf de vragen in het **{language}**."
+    lang_hint = f"\nSchrijf de vragen in het **{language}**." if language else ""
+
+    if (biz_type or "").lower() == "online":
+        scope_hint = (
+            f"\n- Behandel **{locatie}** als primaire markt (land/regio)."
+            f"\n- Vermijd plaatsnamen, ‘near me’ en straatadressen."
+            f"\n- Focus op vergelijken/kiezen van online aanbieders, levering, prijs/kwaliteit, reviews."
+        )
+        examples = (
+            "\nVoorbeelden (niet kopiëren, alleen als stijl):"
+            f"\n• Waar koop ik [product/dienst] online in {locatie}?"
+            f"\n• Welke [productcategorie] platforms leveren snel in {locatie}?"
+            f"\n• Top beoordeelde aanbieders voor [dienst] in {locatie}?"
+            f"\n• Beste prijs/kwaliteit voor [product] met bezorging in {locatie}?"
+        )
+    else:
+        scope_hint = (
+            f"\n- Richt je op lokaal zoeken in/om **{locatie}** (plaats-/regiobenamingen zijn goed)."
+            f"\n- ‘near me’, openingstijden, afhalen/afspraak mogen."
+        )
+        examples = (
+            "\nVoorbeelden (niet kopiëren, alleen als stijl):"
+            f"\n• Beste [dienst] in {locatie}?"
+            f"\n• Betaalbare [dienst] nabij {locatie} (open vandaag)?"
+            f"\n• Waar kan ik [product] kopen in {locatie}?"
+        )
 
     prompt = f"""
-Je bent een SEO-expert gespecialiseerd in AI-zoekgedrag.
+Je bent een SEO-expert in AI-zoekgedrag.
 
-Je krijgt hieronder een omschrijving van een bedrijf/dienst.
-
-1) Bepaal impliciet de kern:
-   - business type
-   - 2–3 belangrijkste diensten/producten
-   - eventuele unieke kenmerken
-2) Genereer vervolgens {n} natuurlijke vragen die een gebruiker aan AI-zoekmachines
-   (zoals ChatGPT of Perplexity) zou stellen om zo'n aanbieder in **{locatie}** te vinden.
-   - Realistisch, kort en natuurlijk geformuleerd.
-   - Focus op zoeken/vergelijken van aanbieders.
-   - Geen bedrijfsnamen, fictieve situaties of uitleg.
-   - Eén vraag per regel.{lang_hint}
+Opdracht:
+1) Begrijp kort de kern uit de omschrijving (type aanbieder, topdiensten, unieke punten).
+2) Genereer {n} natuurlijke vragen die een gebruiker aan ChatGPT/Perplexity zou stellen
+   om zo'n aanbieder te vinden.{scope_hint}
+   - Eén vraag per regel, kort en natuurlijk.
+   - Geen bedrijfsnamen in de vraag, geen uitleg of nummering.{lang_hint}
+{examples}
 
 Omschrijving:
 \"\"\"{description}\"\"\"
@@ -140,11 +163,7 @@ Omschrijving:
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
-        # --- FIX: geen parser-gedoe, gewoon expliciet kiezen ---
-        if met_vraagteken:
-            regels = met_vraagteken[:n]
-        else:
-            regels = regels[:n]
+        regels = (met_vraagteken or regels)[:n]
     return regels
 
 
@@ -198,7 +217,6 @@ def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str |
     if not antwoord:
         return False
     t = antwoord.lower()
-    # --- FIX: Python gebruikt 'and', niet 'en'
     return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
 
@@ -210,6 +228,7 @@ def run_vindbaarheidsscan(
     n: int = 10,
     collect: bool = False,
     language: str | None = None,
+    biz_type: str | None = None,
 ):
     """Als collect=True, retourneer (score, items) met Q&A."""
     try:
@@ -220,7 +239,7 @@ def run_vindbaarheidsscan(
 
     start_ts = time.time()
 
-    vragen = genereer_zoekvragen(description, locatie, n=n, language=language)
+    vragen = genereer_zoekvragen(description, locatie, n=n, language=language, biz_type=biz_type)
     if not vragen:
         return 0 if not collect else (0, [])
 
@@ -282,6 +301,7 @@ def scan():
     website_url  = (data.get("website_url") or "").strip()
     email        = (data.get("email")       or "").strip() or None
     language     = (data.get("language")    or "").strip() or None
+    biz_type     = (data.get("biz_type")    or "").strip().lower() or None  # "online" | "physical"
 
     domein = (
         website_url.replace("https://", "").replace("http://", "").replace("/", "").lower()
@@ -310,20 +330,21 @@ def scan():
                 "description": description,
                 "location": locatie,
                 "website_url": website_url,
-                "email": email
+                "email": email,
+                "biz_type": biz_type
             }
         }), 400
 
     if return_details:
         score, items = run_vindbaarheidsscan(
-            bedrijfsnaam, description, locatie, domein, n=n, collect=True, language=language
+            bedrijfsnaam, description, locatie, domein, n=n, collect=True, language=language, biz_type=biz_type
         )
         # Opslaan in DB (met email)
         save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
         return jsonify({"score": score, "items": items}), 200
     else:
         score = run_vindbaarheidsscan(
-            bedrijfsnaam, description, locatie, domein, n=n, collect=False, language=language
+            bedrijfsnaam, description, locatie, domein, n=n, collect=False, language=language, biz_type=biz_type
         )
         # Opslaan in DB (met email)
         save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
