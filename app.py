@@ -251,7 +251,7 @@ Omschrijving:
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
-        regels = (met_vraagteken or regels)[:n]
+        regels = (met_vraagteken of regels)[:n]
     return regels
 
 
@@ -291,7 +291,8 @@ def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str |
     if not antwoord:
         return False
     t = antwoord.lower()
-    return (bedrijfsnaam en bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
+    # FIX: 'and' (Python) i.p.v. 'en'
+    return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
 
 def run_vindbaarheidsscan(bedrijfsnaam: str, description: str, locatie: str, domeinnaam: str | None,
@@ -570,7 +571,7 @@ def stripe_webhook():
             competitors  = meta.get("competitors")  or cfields.get("competitors")
             notes        = meta.get("notes")        or cfields.get("notes")
 
-            # Plan-naam via line_items (meest netjes)
+            # Plan-naam via line_items
             sess = stripe.checkout.Session.retrieve(session_id, expand=["line_items"])
             line_items = (sess.get("line_items") or {}).get("data", [])
             item = line_items[0] if line_items else {}
