@@ -377,20 +377,26 @@ def list_scans():
         log.exception("Fout bij ophalen scans: %s", e)
         return jsonify({"error": "DB query failed"}), 500
 
-# --------------- CONTACT: mail via Zoho SMTP ---------------
-def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None):
+# --------------- MAIL HELPERS ---------------
+def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None, to_addr: str | None = None):
+    """
+    Default naar CONTACT_TO, maar kan ook een expliciete ontvanger krijgen (bv. klant).
+    """
     if not (SMTP_USER and SMTP_PASS):
         raise RuntimeError("SMTP credentials missing")
+
+    to_addr = to_addr or CONTACT_TO
     msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = formataddr(("ASEO", SMTP_USER))
-    msg["To"] = CONTACT_TO
+    msg["To"] = to_addr
     if reply_to:
         msg["Reply-To"] = reply_to
+
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(SMTP_USER, [CONTACT_TO], msg.as_string())
+        s.sendmail(SMTP_USER, [to_addr], msg.as_string())
 
 @app.route("/contact", methods=["POST", "OPTIONS"])
 @cross_origin(origins=ALLOWED_ORIGINS or ["*"], methods=["POST", "OPTIONS"], allow_headers=["Content-Type"])
@@ -412,7 +418,7 @@ def contact():
       <hr><p>Sent from aseon.io/contact</p>
     """
     try:
-        send_mail_via_zoho(subj, body, reply_to=email)
+        send_mail_via_zoho(subj, body, reply_to=email, to_addr=CONTACT_TO)
         return jsonify({"ok": True}), 200
     except Exception as e:
         log.exception("contact send failed: %s", e)
@@ -427,30 +433,6 @@ def _safe(d, *path, default=None):
         else:
             return default
     return cur
-
-def _email_payment_summary(title: str, payload: dict):
-    """
-    Bouwt een nette HTML mail voor betalingen/subscriptions.
-    """
-    lines = []
-    kv = [
-        ("Event", payload.get("event_type")),
-        ("Mode", payload.get("mode")),
-        ("Status", payload.get("status")),
-        ("Subscription", "yes" if payload.get("is_subscription") else "no"),
-        ("Plan", payload.get("plan") or "-"),
-        ("Amount", f"{(payload.get('amount_total') or 0)/100:.2f} {payload.get('currency','').upper()}"),
-        ("Customer", f"{payload.get('customer_name') or ''} ({payload.get('customer_email') or '-'})"),
-        ("Stripe event id", payload.get("event_id")),
-    ]
-    for k, v in kv:
-        lines.append(f"<tr><td style='padding:4px 8px'><b>{k}</b></td><td style='padding:4px 8px'>{v}</td></tr>")
-    return f"""
-      <h3>{title}</h3>
-      <table cellpadding="0" cellspacing="0" border="0">{''.join(lines)}</table>
-      <hr>
-      <small>Automatische notificatie · ASEO</small>
-    """
 
 @app.route("/webhook/stripe", methods=["POST"])
 def stripe_webhook():
@@ -469,23 +451,23 @@ def stripe_webhook():
         log.warning("Invalid payload")
         return ("", 400)
 
-    etype = event["type"]
-    obj = event["data"]["object"]
+    etype = event.get("type", "")
+    obj = event.get("data", {}).get("object", {}) or {}
     log.info("Stripe event: %s", etype)
 
-    # Defaults
+    # Basisgegevens voor logging
     mode = _safe(obj, "mode")
     status = _safe(obj, "status") or _safe(obj, "payment_status")
     customer_email = _safe(obj, "customer_details", "email") or _safe(obj, "customer_email")
     customer_name  = _safe(obj, "customer_details", "name")
-    plan = (_safe(obj, "metadata", "plan")
-            or _safe(obj, "metadata", "product")
-            or _safe(obj, "subscription_details", "metadata", "plan"))
-    amount_total = _safe(obj, "amount_total")
-    currency = _safe(obj, "currency")
-    is_sub = (mode == "subscription") or ("subscription" in etype)
+    amount_total   = _safe(obj, "amount_total")
+    currency       = _safe(obj, "currency")
+    is_sub         = (mode == "subscription") or ("subscription" in etype.lower())
 
-    # Per event bijsturen waar nodig
+    plan = (_safe(obj, "metadata", "plan")
+            or _safe(obj, "metadata", "product"))
+
+    # Extra velden bij invoice.*
     if etype.startswith("invoice."):
         mode = "subscription"
         is_sub = True
@@ -493,20 +475,19 @@ def stripe_webhook():
         amount_total = _safe(obj, "total") or amount_total
         currency = _safe(obj, "currency") or currency
         status = _safe(obj, "status") or status
-        # vaak is plannaam via lines -> data[0] -> price -> nickname/product metadata
         try:
             line = (obj.get("lines", {}).get("data") or [])[0]
             plan = _safe(line, "price", "nickname") or plan
         except Exception:
             pass
 
-    # payment_intent.succeeded (fallback, zelden nodig met Checkout)
+    # fallback
     if etype == "payment_intent.succeeded":
         amount_total = _safe(obj, "amount_received") or _safe(obj, "amount")
         currency = _safe(obj, "currency") or currency
         status = "succeeded"
 
-    # Wegschrijven
+    # Wegschrijven naar DB (indien geconfigureerd)
     save_payment_event(
         event_id=event["id"],
         event_type=etype,
@@ -521,42 +502,43 @@ def stripe_webhook():
         raw=event
     )
 
-    # E-mail notificaties (alleen voor key momenten)
-    try:
-        if etype in (
-            "checkout.session.completed",
-            "invoice.paid",
-            "invoice.payment_failed",
-            "customer.subscription.created",
-            "customer.subscription.updated",
-            "customer.subscription.deleted",
-            "payment_intent.succeeded",
-        ):
-            title_map = {
-                "checkout.session.completed": "✅ Checkout completed",
-                "invoice.paid": "✅ Subscription invoice paid",
-                "invoice.payment_failed": "❌ Subscription payment failed",
-                "customer.subscription.created": "🟢 Subscription created",
-                "customer.subscription.updated": "✏️ Subscription updated",
-                "customer.subscription.deleted": "🔴 Subscription canceled",
-                "payment_intent.succeeded": "✅ Payment intent succeeded",
-            }
-            summary = dict(
-                event_id=event["id"],
-                event_type=etype,
-                mode=mode,
-                status=status,
-                is_subscription=bool(is_sub),
-                customer_email=customer_email,
-                customer_name=customer_name,
-                plan=plan,
-                amount_total=amount_total,
-                currency=currency,
-            )
-            send_mail_via_zoho(title_map.get(etype, "Stripe event"), _email_payment_summary(title_map.get(etype, etype), summary))
-    except Exception as e:
-        log.exception("Stripe mail notify failed: %s", e)
+    # === Alleen klant-bevestiging bij checkout klaar ===
+    if etype == "checkout.session.completed":
+        try:
+            session_id = obj.get("id")
+            sess = stripe.checkout.Session.retrieve(session_id, expand=["line_items"])
+            line_items = (sess.get("line_items") or {}).get("data", [])
+            item = line_items[0] if line_items else {}
+            plan_name = (item.get("description")
+                         or _safe(item, "price", "nickname")
+                         or plan
+                         or "Your ASEO plan")
+            cadence = "monthly subscription" if sess.get("mode") == "subscription" else "one-time purchase"
 
+            if customer_email:
+                subject_user = f"Thanks — your {plan_name} ({cadence}) is confirmed"
+                body_user = f"""
+                  <h2>Welcome to ASEO 🎉</h2>
+                  <p>Thanks for your purchase. We've received your payment for <b>{plan_name}</b> ({cadence}).</p>
+                  <p>What happens next:</p>
+                  <ol>
+                    <li>We’ll review your details and set up your onboarding.</li>
+                    <li>You’ll receive next steps by email within 1–2 business days.</li>
+                  </ol>
+                  <p>If you have questions, just reply to this email.</p>
+                  <hr>
+                  <p>— Team ASEO</p>
+                """.strip()
+                try:
+                    # stuur naar klant
+                    send_mail_via_zoho(subject_user, body_user, reply_to=None, to_addr=customer_email)
+                except Exception as e:
+                    log.exception("Failed sending user confirmation: %s", e)
+                    # toch 200 teruggeven; Stripe retried anders eindeloos
+        except Exception as e:
+            log.exception("Error handling checkout.session.completed: %s", e)
+
+    # Overige events: geen e-mails versturen
     return jsonify({"received": True})
 
 # --------------- Main ----------------
