@@ -99,10 +99,11 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
         log.exception("DB insert failed: %s", e)
         return False
 
+
 def save_payment_event(event_id: str, event_type: str, mode: str | None, status: str | None,
                        is_subscription: bool, customer_email: str | None, customer_name: str | None,
                        plan: str | None, amount_total: int | None, currency: str | None, raw: dict | None):
-    """Slaat stripe event/payment samen in 'payments'."""
+    """Slaat Stripe event/payment in 'payments'."""
     if not ENGINE:
         log.info("DATABASE_URL ontbreekt; sla payment DB-write over.")
         return False
@@ -130,6 +131,41 @@ def save_payment_event(event_id: str, event_type: str, mode: str | None, status:
         return True
     except Exception as e:
         log.exception("Payment insert failed: %s", e)
+        return False
+
+
+def save_checkout_session(session_id: str, customer_email: str | None, customer_name: str | None,
+                          company_name: str | None, competitors: str | None, notes: str | None,
+                          plan: str | None, amount_total: int | None, currency: str | None, raw: dict | None):
+    """Slaat de ingevulde velden van Checkout op in 'checkout_sessions'."""
+    if not ENGINE:
+        log.info("DATABASE_URL ontbreekt; sla checkout_session DB-write over.")
+        return False
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO checkout_sessions
+                  (session_id, customer_email, customer_name, company_name, competitors, notes,
+                   plan, amount_total, currency, raw)
+                VALUES
+                  (:session_id, :customer_email, :customer_name, :company_name, :competitors, :notes,
+                   :plan, :amount_total, :currency, :raw::jsonb)
+                ON CONFLICT (session_id) DO NOTHING
+            """), dict(
+                session_id=session_id,
+                customer_email=customer_email,
+                customer_name=customer_name,
+                company_name=company_name,
+                competitors=competitors,
+                notes=notes,
+                plan=plan,
+                amount_total=amount_total,
+                currency=currency,
+                raw=(raw or {})
+            ))
+        return True
+    except Exception as e:
+        log.exception("Checkout session insert failed: %s", e)
         return False
 
 # --------------- reCAPTCHA helper ---------------
@@ -218,6 +254,7 @@ Omschrijving:
         regels = (met_vraagteken or regels)[:n]
     return regels
 
+
 def vraag_perplexity(prompt: str, return_errors: bool = False):
     headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -249,11 +286,13 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         log.warning("Perplexity parse-fout: %s; body=%s", e, r.text[:200])
         return (f"__ERR parse: {e}") if return_errors else None
 
+
 def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str | None = None) -> bool:
     if not antwoord:
         return False
     t = antwoord.lower()
-    return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
+    return (bedrijfsnaam en bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
+
 
 def run_vindbaarheidsscan(bedrijfsnaam: str, description: str, locatie: str, domeinnaam: str | None,
                           n: int = 10, collect: bool = False, language: str | None = None,
@@ -434,6 +473,26 @@ def _safe(d, *path, default=None):
             return default
     return cur
 
+def _extract_custom_fields(obj: dict) -> dict:
+    """
+    Haalt Stripe Checkout 'custom_fields' op als {key: value}.
+    Werkt met text/numeric/dropdown varianten.
+    """
+    out = {}
+    fields = obj.get("custom_fields") or []
+    for f in fields:
+        key = f.get("key") or (f.get("label", {}).get("custom") or "").strip().lower().replace(" ", "_")
+        val = None
+        if isinstance(f.get("text"), dict):
+            val = f["text"].get("value")
+        elif isinstance(f.get("numeric"), dict):
+            val = str(f["numeric"].get("value"))
+        elif isinstance(f.get("dropdown"), dict):
+            val = f["dropdown"].get("value")
+        if key and (val is not None):
+            out[key] = val
+    return out
+
 @app.route("/webhook/stripe", methods=["POST"])
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -455,7 +514,7 @@ def stripe_webhook():
     obj = event.get("data", {}).get("object", {}) or {}
     log.info("Stripe event: %s", etype)
 
-    # Basisgegevens voor logging
+    # Basisgegevens
     mode = _safe(obj, "mode")
     status = _safe(obj, "status") or _safe(obj, "payment_status")
     customer_email = _safe(obj, "customer_details", "email") or _safe(obj, "customer_email")
@@ -463,11 +522,9 @@ def stripe_webhook():
     amount_total   = _safe(obj, "amount_total")
     currency       = _safe(obj, "currency")
     is_sub         = (mode == "subscription") or ("subscription" in etype.lower())
+    plan           = (_safe(obj, "metadata", "plan") or _safe(obj, "metadata", "product"))
 
-    plan = (_safe(obj, "metadata", "plan")
-            or _safe(obj, "metadata", "product"))
-
-    # Extra velden bij invoice.*
+    # invoice.* bijsturen
     if etype.startswith("invoice."):
         mode = "subscription"
         is_sub = True
@@ -481,13 +538,13 @@ def stripe_webhook():
         except Exception:
             pass
 
-    # fallback
+    # payment_intent fallback
     if etype == "payment_intent.succeeded":
         amount_total = _safe(obj, "amount_received") or _safe(obj, "amount")
         currency = _safe(obj, "currency") or currency
         status = "succeeded"
 
-    # Wegschrijven naar DB (indien geconfigureerd)
+    # Altijd: payment event loggen
     save_payment_event(
         event_id=event["id"],
         event_type=etype,
@@ -502,19 +559,43 @@ def stripe_webhook():
         raw=event
     )
 
-    # === Alleen klant-bevestiging bij checkout klaar ===
+    # === Na geslaagde checkout: data in checkout_sessions + mail naar klant ===
     if etype == "checkout.session.completed":
         try:
             session_id = obj.get("id")
+            # Custom fields/metadata uit de Session zelf
+            meta = obj.get("metadata") or {}
+            cfields = _extract_custom_fields(obj)
+            company_name = meta.get("company_name") or cfields.get("company_name") or cfields.get("company")
+            competitors  = meta.get("competitors")  or cfields.get("competitors")
+            notes        = meta.get("notes")        or cfields.get("notes")
+
+            # Plan-naam via line_items (meest netjes)
             sess = stripe.checkout.Session.retrieve(session_id, expand=["line_items"])
             line_items = (sess.get("line_items") or {}).get("data", [])
             item = line_items[0] if line_items else {}
             plan_name = (item.get("description")
                          or _safe(item, "price", "nickname")
                          or plan
-                         or "Your ASEO plan")
+                         or "ASEO plan")
+
             cadence = "monthly subscription" if sess.get("mode") == "subscription" else "one-time purchase"
 
+            # DB: checkout_sessions
+            save_checkout_session(
+                session_id=session_id,
+                customer_email=customer_email,
+                customer_name=customer_name,
+                company_name=company_name,
+                competitors=competitors,
+                notes=notes,
+                plan=plan_name,
+                amount_total=amount_total,
+                currency=currency,
+                raw=event
+            )
+
+            # Klantbevestiging
             if customer_email:
                 subject_user = f"Thanks — your {plan_name} ({cadence}) is confirmed"
                 body_user = f"""
@@ -530,15 +611,13 @@ def stripe_webhook():
                   <p>— Team ASEO</p>
                 """.strip()
                 try:
-                    # stuur naar klant
-                    send_mail_via_zoho(subject_user, body_user, reply_to=None, to_addr=customer_email)
+                    send_mail_via_zoho(subject_user, body_user, to_addr=customer_email)
                 except Exception as e:
                     log.exception("Failed sending user confirmation: %s", e)
-                    # toch 200 teruggeven; Stripe retried anders eindeloos
+
         except Exception as e:
             log.exception("Error handling checkout.session.completed: %s", e)
 
-    # Overige events: geen e-mails versturen
     return jsonify({"received": True})
 
 # --------------- Main ----------------
