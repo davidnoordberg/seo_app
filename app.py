@@ -444,7 +444,8 @@ def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None
     to_addr = to_addr or CONTACT_TO
     msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = formataddr(("ASEO", SMTP_USER))
+    # From-naam op "Aseon"
+    msg["From"] = formataddr(("Aseon", SMTP_USER))
     msg["To"] = to_addr
     if reply_to:
         msg["Reply-To"] = reply_to
@@ -666,7 +667,7 @@ def stripe_webhook():
             plan_name = (item.get("description")
                          or _safe(item, "price", "nickname")
                          or plan
-                         or "ASEO plan")
+                         or "Aseon plan")
 
             cadence = "monthly subscription" if sess.get("mode") == "subscription" else "one-time purchase"
 
@@ -683,19 +684,27 @@ def stripe_webhook():
                 raw=event
             )
 
+            # --- Warmere bevestigingsmail ---
             if customer_email:
-                subject_user = f"Thanks — your {plan_name} ({cadence}) is confirmed"
+                first_name = (customer_name or "").split(" ")[0] or "there"
+                subject_user = f"Welcome to Aseon — your {plan_name} ({cadence}) is confirmed"
                 body_user = f"""
-                  <h2>Welcome to ASEO 🎉</h2>
-                  <p>Thanks for your purchase. We've received your payment for <b>{plan_name}</b> ({cadence}).</p>
-                  <p>What happens next:</p>
-                  <ol>
-                    <li>We’ll review your details and set up your onboarding.</li>
-                    <li>You’ll receive next steps by email within 1–2 business days.</li>
-                  </ol>
-                  <p>If you have questions, just reply to this email.</p>
-                  <hr>
-                  <p>— Team ASEO</p>
+                  <div style="font:16px/1.6 -apple-system,Segoe UI,Roboto,Inter,sans-serif;color:#222">
+                    <h2 style="margin:0 0 12px">Welcome to Aseon 🎉</h2>
+                    <p>Hi {first_name},</p>
+                    <p>Great to have you with us! We've received your payment for <b>{plan_name}</b> ({cadence}).</p>
+                    <p style="margin:18px 0 6px"><b>What happens next</b></p>
+                    <ol style="margin-top:8px">
+                      <li>We'll review your details{f" for <b>{company_name}</b>" if company_name else ""} and set up your onboarding.</li>
+                      <li>You'll receive your next steps by email within 1–2 business days.</li>
+                    </ol>
+                    {"<p>Competitors noted: <i>"+competitors+"</i></p>" if competitors else ""}
+                    {"<p>Notes received: <i>"+notes+"</i></p>" if notes else ""}
+                    <p>If anything changes or you have questions, just reply to this email — we read every message.</p>
+                    <hr style="border:none;border-top:1px solid #eee;margin:20px 0">
+                    <p style="margin:0">— Team Aseon</p>
+                    <p style="color:#666;margin:6px 0 0;font-size:13px">Need help? <a href="mailto:info@aseon.io">info@aseon.io</a></p>
+                  </div>
                 """.strip()
                 try:
                     send_mail_via_zoho(subject_user, body_user, to_addr=customer_email)
