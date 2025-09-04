@@ -684,7 +684,7 @@ def stripe_webhook():
                 raw=event
             )
 
-            # --- Warmere bevestigingsmail ---
+            # --- Confirmation email (GEO wording, simple promise) ---
             if customer_email:
                 first_name = (customer_name or "").split(" ")[0] or "there"
                 subject_user = f"Welcome to Aseon — your {plan_name} ({cadence}) is confirmed"
@@ -692,15 +692,15 @@ def stripe_webhook():
                   <div style="font:16px/1.6 -apple-system,Segoe UI,Roboto,Inter,sans-serif;color:#222">
                     <h2 style="margin:0 0 12px">Welcome to Aseon 🎉</h2>
                     <p>Hi {first_name},</p>
-                    <p>Great to have you with us! We've received your payment for <b>{plan_name}</b> ({cadence}).</p>
+                    <p>Thank you for your purchase! We’ve successfully received your payment for <b>{plan_name}</b> ({cadence}).</p>
+
                     <p style="margin:18px 0 6px"><b>What happens next</b></p>
                     <ol style="margin-top:8px">
-                      <li>We'll review your details{f" for <b>{company_name}</b>" if company_name else ""} and set up your onboarding.</li>
-                      <li>You'll receive your next steps by email within 1–2 business days.</li>
+                      <li>Our team will get started right away.</li>
+                      <li>You’ll receive your full <b>GEO Report</b> in your inbox within <b>7 business days</b>.</li>
                     </ol>
-                    {"<p>Competitors noted: <i>"+competitors+"</i></p>" if competitors else ""}
-                    {"<p>Notes received: <i>"+notes+"</i></p>" if notes else ""}
-                    <p>If anything changes or you have questions, just reply to this email — we read every message.</p>
+
+                    <p>If you have any questions in the meantime, just reply to this email — we’d love to hear from you.</p>
                     <hr style="border:none;border-top:1px solid #eee;margin:20px 0">
                     <p style="margin:0">— Team Aseon</p>
                     <p style="color:#666;margin:6px 0 0;font-size:13px">Need help? <a href="mailto:info@aseon.io">info@aseon.io</a></p>
