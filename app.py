@@ -40,6 +40,16 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 if STRIPE_SECRET:
     stripe.api_key = STRIPE_SECRET
 
+# Checkout redirect urls
+CHECKOUT_SUCCESS_URL = os.environ.get(
+    "CHECKOUT_SUCCESS_URL",
+    "https://aseo-70fee3.webflow.io/thanks?session_id={CHECKOUT_SESSION_ID}",
+)
+CHECKOUT_CANCEL_URL = os.environ.get(
+    "CHECKOUT_CANCEL_URL",
+    "https://aseo-70fee3.webflow.io/subscription?canceled=1",
+)
+
 def _adapt_url_for_sqlalchemy(url: str) -> str:
     if not url:
         return ""
@@ -71,7 +81,18 @@ CORS(app, resources={
     r"/scan": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
     r"/contact": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
     r"/ping": {"origins": "*"},
+    r"/checkout/start": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
+    r"/webhook/stripe": {"origins": "*"},
 })
+
+# ---------- Stripe plan config (uses your PRODUCT ids + EUR amounts) ----------
+PLAN_CONFIG = {
+    "basic":    {"product": "prod_SzJLEa6TFnCBvC",   "amount": 17900, "interval": "month", "name": "Basic"},
+    "standard": {"product": "prod_SzJMgfOwJCIA44",   "amount": 34900, "interval": "month", "name": "Standard"},
+    "premium":  {"product": "prod_SzJNSVZi2ow0od",   "amount": 59900, "interval": "month", "name": "Premium"},
+    "boost":    {"product": "prod_SzJOgIxi9e0OLZ",   "amount": 84900, "interval": None,    "name": "Boost"},
+}
+CURRENCY = "eur"
 
 # ---------- DB helpers ----------
 def save_scan_to_db(name: str, website_url: str | None, description: str | None,
@@ -103,7 +124,6 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
 def save_payment_event(event_id: str, event_type: str, mode: str | None, status: str | None,
                        is_subscription: bool, customer_email: str | None, customer_name: str | None,
                        plan: str | None, amount_total: int | None, currency: str | None, raw: dict | None):
-    """Slaat Stripe event/payment in 'payments'."""
     if not ENGINE:
         log.info("DATABASE_URL ontbreekt; sla payment DB-write over.")
         return False
@@ -137,7 +157,6 @@ def save_payment_event(event_id: str, event_type: str, mode: str | None, status:
 def save_checkout_session(session_id: str, customer_email: str | None, customer_name: str | None,
                           company_name: str | None, competitors: str | None, notes: str | None,
                           plan: str | None, amount_total: int | None, currency: str | None, raw: dict | None):
-    """Slaat de ingevulde velden van Checkout op in 'checkout_sessions'."""
     if not ENGINE:
         log.info("DATABASE_URL ontbreekt; sla checkout_session DB-write over.")
         return False
@@ -251,7 +270,8 @@ Omschrijving:
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
-        regels = (met_vraagteken or regels)[:n]
+        selected = met_vraagteken if met_vraagteken else regels
+        regels = selected[:n]
     return regels
 
 
@@ -291,7 +311,6 @@ def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str |
     if not antwoord:
         return False
     t = antwoord.lower()
-    # FIX: 'and' (Python) i.p.v. 'en'
     return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
 
@@ -419,9 +438,6 @@ def list_scans():
 
 # --------------- MAIL HELPERS ---------------
 def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None, to_addr: str | None = None):
-    """
-    Default naar CONTACT_TO, maar kan ook een expliciete ontvanger krijgen (bv. klant).
-    """
     if not (SMTP_USER and SMTP_PASS):
         raise RuntimeError("SMTP credentials missing")
 
@@ -464,6 +480,84 @@ def contact():
         log.exception("contact send failed: %s", e)
         return jsonify({"error": "email_failed"}), 500
 
+# --------------- CHECKOUT START (save form + create Stripe Session) ---------------
+@app.route("/checkout/start", methods=["POST", "OPTIONS"])
+@cross_origin(origins=ALLOWED_ORIGINS or ["*"], methods=["POST", "OPTIONS"], allow_headers=["Content-Type"])
+def checkout_start():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if not STRIPE_SECRET:
+        return jsonify({"error": "Stripe not configured"}), 500
+
+    data = (request.get_json(silent=True) or request.form.to_dict() or {})
+    log.info("DEBUG /checkout/start incoming: %s", data)
+
+    # Fields from frontend form
+    plan_key    = (data.get("plan") or "basic").strip().lower()
+    full_name   = (data.get("name") or "").strip()
+    company     = (data.get("company") or "").strip()
+    email       = (data.get("email") or "").strip()
+    competitors = (data.get("competitors") or "").strip()
+    notes       = (data.get("notes") or "").strip()
+
+    if not (full_name and email and plan_key in PLAN_CONFIG):
+        return jsonify({"error": "missing or invalid fields"}), 400
+
+    plan_cfg = PLAN_CONFIG[plan_key]
+    mode = "subscription" if plan_cfg["interval"] else "payment"
+
+    # Build line item using existing product ids + ad-hoc price_data
+    price_data = {
+        "currency": CURRENCY,
+        "product": plan_cfg["product"],
+        "unit_amount": plan_cfg["amount"],
+    }
+    if mode == "subscription":
+        price_data["recurring"] = {"interval": plan_cfg["interval"]}
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode=mode,
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": price_data,
+                "quantity": 1,
+            }],
+            success_url=CHECKOUT_SUCCESS_URL,
+            cancel_url=CHECKOUT_CANCEL_URL,
+            customer_email=email,
+            metadata={
+                "plan": plan_cfg["name"],
+                "plan_key": plan_key,
+                "form_name": full_name,
+                "company_name": company,
+                "competitors": competitors,
+                "notes": notes,
+            },
+            allow_promotion_codes=True,
+        )
+
+        # Save immediately for Beekeeper visibility even before webhook
+        save_checkout_session(
+            session_id=session["id"],
+            customer_email=email,
+            customer_name=full_name,
+            company_name=company,
+            competitors=competitors,
+            notes=notes,
+            plan=plan_cfg["name"],
+            amount_total=plan_cfg["amount"],
+            currency=CURRENCY,
+            raw={"local": "created_via_checkout_start"}
+        )
+
+        return jsonify({"url": session["url"]}), 200
+
+    except Exception as e:
+        log.exception("Stripe session create failed: %s", e)
+        return jsonify({"error": "stripe_error"}), 500
+
 # --------------- STRIPE WEBHOOK ----------------
 def _safe(d, *path, default=None):
     cur = d or {}
@@ -475,10 +569,6 @@ def _safe(d, *path, default=None):
     return cur
 
 def _extract_custom_fields(obj: dict) -> dict:
-    """
-    Haalt Stripe Checkout 'custom_fields' op als {key: value}.
-    Werkt met text/numeric/dropdown varianten.
-    """
     out = {}
     fields = obj.get("custom_fields") or []
     for f in fields:
@@ -515,7 +605,7 @@ def stripe_webhook():
     obj = event.get("data", {}).get("object", {}) or {}
     log.info("Stripe event: %s", etype)
 
-    # Basisgegevens
+    # Base fields
     mode = _safe(obj, "mode")
     status = _safe(obj, "status") or _safe(obj, "payment_status")
     customer_email = _safe(obj, "customer_details", "email") or _safe(obj, "customer_email")
@@ -525,7 +615,7 @@ def stripe_webhook():
     is_sub         = (mode == "subscription") or ("subscription" in etype.lower())
     plan           = (_safe(obj, "metadata", "plan") or _safe(obj, "metadata", "product"))
 
-    # invoice.* bijsturen
+    # invoice.* adjustments
     if etype.startswith("invoice."):
         mode = "subscription"
         is_sub = True
@@ -545,7 +635,7 @@ def stripe_webhook():
         currency = _safe(obj, "currency") or currency
         status = "succeeded"
 
-    # Altijd: payment event loggen
+    # Save payment event
     save_payment_event(
         event_id=event["id"],
         event_type=etype,
@@ -560,18 +650,16 @@ def stripe_webhook():
         raw=event
     )
 
-    # === Na geslaagde checkout: data in checkout_sessions + mail naar klant ===
+    # After successful checkout: persist details + send email
     if etype == "checkout.session.completed":
         try:
             session_id = obj.get("id")
-            # Custom fields/metadata uit de Session zelf
             meta = obj.get("metadata") or {}
             cfields = _extract_custom_fields(obj)
             company_name = meta.get("company_name") or cfields.get("company_name") or cfields.get("company")
             competitors  = meta.get("competitors")  or cfields.get("competitors")
             notes        = meta.get("notes")        or cfields.get("notes")
 
-            # Plan-naam via line_items
             sess = stripe.checkout.Session.retrieve(session_id, expand=["line_items"])
             line_items = (sess.get("line_items") or {}).get("data", [])
             item = line_items[0] if line_items else {}
@@ -582,7 +670,6 @@ def stripe_webhook():
 
             cadence = "monthly subscription" if sess.get("mode") == "subscription" else "one-time purchase"
 
-            # DB: checkout_sessions
             save_checkout_session(
                 session_id=session_id,
                 customer_email=customer_email,
@@ -596,7 +683,6 @@ def stripe_webhook():
                 raw=event
             )
 
-            # Klantbevestiging
             if customer_email:
                 subject_user = f"Thanks — your {plan_name} ({cadence}) is confirmed"
                 body_user = f"""
