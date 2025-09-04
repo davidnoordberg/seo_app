@@ -251,7 +251,7 @@ Omschrijving:
     regels = [r.strip("-• ").strip() for r in content.split("\n") if r.strip()]
     if len(regels) > n:
         met_vraagteken = [r for r in regels if "?" in r]
-        regels = (met_vraagteken of regels)[:n]
+        regels = (met_vraagteken or regels)[:n]
     return regels
 
 
