@@ -133,7 +133,7 @@ def save_payment_event(event_id: str, event_type: str, mode: str | None, status:
                 INSERT INTO payments (event_id, event_type, mode, status, is_subscription,
                                       customer_email, customer_name, plan, amount_total, currency, raw)
                 VALUES (:event_id, :event_type, :mode, :status, :is_subscription,
-                        :customer_email, :customer_name, :plan, :amount_total, :currency, :raw::jsonb)
+                        :customer_email, :customer_name, :plan, :amount_total, :currency, :raw)
                 ON CONFLICT (event_id) DO NOTHING
             """), dict(
                 event_id=event_id,
@@ -168,7 +168,7 @@ def save_checkout_session(session_id: str, customer_email: str | None, customer_
                    plan, amount_total, currency, raw)
                 VALUES
                   (:session_id, :customer_email, :customer_name, :company_name, :competitors, :notes,
-                   :plan, :amount_total, :currency, :raw::jsonb)
+                   :plan, :amount_total, :currency, :raw)
                 ON CONFLICT (session_id) DO NOTHING
             """), dict(
                 session_id=session_id,
