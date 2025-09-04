@@ -4,6 +4,7 @@ import logging
 import requests
 import openai
 import smtplib
+import stripe
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
@@ -23,7 +24,7 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4-turbo")
 # reCAPTCHA secret
 RECAPTCHA_SECRET = os.environ.get("RECAPTCHA_SECRET", "").strip()
 
-# Database (gebruik je Internal URL op Render als DATABASE_URL)
+# Database (Render Internal URL als DATABASE_URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 # SMTP / contact
@@ -33,11 +34,13 @@ SMTP_USER = os.environ.get("SMTP_USER", "info@aseon.io")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 CONTACT_TO = os.environ.get("CONTACT_TO", "info@aseon.io")
 
+# Stripe
+STRIPE_SECRET = os.environ.get("STRIPE_SECRET", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+if STRIPE_SECRET:
+    stripe.api_key = STRIPE_SECRET
+
 def _adapt_url_for_sqlalchemy(url: str) -> str:
-    """
-    Maak van 'postgresql://user:pass@host/db' -> 'postgresql+pg8000://user:pass@host/db'
-    (of 'postgres://' -> 'postgresql+pg8000://...')
-    """
     if not url:
         return ""
     if url.startswith("postgres://"):
@@ -48,13 +51,13 @@ def _adapt_url_for_sqlalchemy(url: str) -> str:
 
 ENGINE = create_engine(_adapt_url_for_sqlalchemy(DATABASE_URL), pool_pre_ping=True) if DATABASE_URL else None
 
-# Tuning (kan via Render env worden overschreven)
-DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))     # max aantal vragen
-MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300")) # totaal budget (5 min)
-PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))  # read-timeout per call
-SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))     # kleine pauze tussen calls
+# Tuning
+DEFAULT_MAX_N            = int(os.environ.get("MAX_QUESTIONS", "10"))
+MAX_SCAN_SECONDS         = int(os.environ.get("MAX_SCAN_SECONDS", "300"))
+PERPLEXITY_HTTP_TIMEOUT  = float(os.environ.get("PERPLEXITY_TIMEOUT", "25"))
+SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))
 
-# Toegestane origins voor CORS (komma-gescheiden)
+# CORS
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://aseo-70fee3.webflow.io").split(",")
     if o.strip()
@@ -64,32 +67,18 @@ ALLOWED_ORIGINS = [
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 app = Flask(__name__)
-
-# CORS (globaal + specifiek /scan en /contact)
 CORS(app, resources={
-    r"/scan": {
-        "origins": ALLOWED_ORIGINS or ["*"],
-        "methods": ["POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
-    },
-    r"/contact": {
-        "origins": ALLOWED_ORIGINS or ["*"],
-        "methods": ["POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
-    },
+    r"/scan": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
+    r"/contact": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
     r"/ping": {"origins": "*"},
 })
 
-# ---------- DB helper ----------
+# ---------- DB helpers ----------
 def save_scan_to_db(name: str, website_url: str | None, description: str | None,
                     location: str | None, language: str | None, score: int,
                     email: str | None) -> bool:
-    """
-    Slaat één rij op in tabel 'scans'. Returnt True bij succes, False bij skip/fout.
-    Vereist env: DATABASE_URL (Internal of External). Tabel 'scans' heb je al aangemaakt.
-    """
     if not ENGINE:
-        log.info("DATABASE_URL ontbreekt of engine niet geconfigureerd; sla DB-write over.")
+        log.info("DATABASE_URL ontbreekt; sla DB-write over.")
         return False
     try:
         with ENGINE.begin() as conn:
@@ -110,19 +99,47 @@ def save_scan_to_db(name: str, website_url: str | None, description: str | None,
         log.exception("DB insert failed: %s", e)
         return False
 
+def save_payment_event(event_id: str, event_type: str, mode: str | None, status: str | None,
+                       is_subscription: bool, customer_email: str | None, customer_name: str | None,
+                       plan: str | None, amount_total: int | None, currency: str | None, raw: dict | None):
+    """Slaat stripe event/payment samen in 'payments'."""
+    if not ENGINE:
+        log.info("DATABASE_URL ontbreekt; sla payment DB-write over.")
+        return False
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO payments (event_id, event_type, mode, status, is_subscription,
+                                      customer_email, customer_name, plan, amount_total, currency, raw)
+                VALUES (:event_id, :event_type, :mode, :status, :is_subscription,
+                        :customer_email, :customer_name, :plan, :amount_total, :currency, :raw::jsonb)
+                ON CONFLICT (event_id) DO NOTHING
+            """), dict(
+                event_id=event_id,
+                event_type=event_type,
+                mode=mode,
+                status=status,
+                is_subscription=is_subscription,
+                customer_email=customer_email,
+                customer_name=customer_name,
+                plan=plan,
+                amount_total=amount_total,
+                currency=currency,
+                raw=(raw or {})
+            ))
+        return True
+    except Exception as e:
+        log.exception("Payment insert failed: %s", e)
+        return False
+
 # --------------- reCAPTCHA helper ---------------
 def verify_recaptcha(token: str, remote_ip: str | None = None):
-    """Valideer reCAPTCHA v2 token server-side. Return (ok: bool, details: dict/str)"""
     if not RECAPTCHA_SECRET:
         return False, {"error": "server_misconfigured: missing RECAPTCHA_SECRET"}
     try:
         r = requests.post(
             "https://www.google.com/recaptcha/api/siteverify",
-            data={
-                "secret": RECAPTCHA_SECRET,
-                "response": token,
-                "remoteip": remote_ip or "",
-            },
+            data={"secret": RECAPTCHA_SECRET, "response": token, "remoteip": remote_ip or ""},
             timeout=10,
         )
         j = r.json()
@@ -131,14 +148,9 @@ def verify_recaptcha(token: str, remote_ip: str | None = None):
         log.exception("reCAPTCHA verify error: %s", e)
         return False, {"error": "network_error"}
 
-# --------------- Helpers ----------------
+# --------------- Scan helpers ----------------
 def genereer_zoekvragen(description: str, locatie: str, n: int = 10,
                          language: str | None = None, biz_type: str | None = None):
-    """
-    Genereer n natuurlijke AI-zoekvragen.
-      - online  : land/regio-focus, geen stad/‘near me’
-      - physical: lokaal zoeken (stad/regio toegestaan)
-    """
     try:
         n = int(n)
     except Exception:
@@ -206,33 +218,19 @@ Omschrijving:
         regels = (met_vraagteken or regels)[:n]
     return regels
 
-
 def vraag_perplexity(prompt: str, return_errors: bool = False):
-    """
-    Vraagt Perplexity. Bij succes: antwoordtekst.
-    Bij fout: None (of als return_errors=True een korte foutstring, zichtbaar in 'items').
-    """
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "sonar",
         "messages": [{
             "role": "user",
-            "content": (
-                "Beantwoord de volgende vraag kort en concreet, in maximaal 3 zinnen. "
-                "Noem alleen bedrijven, merknamen, locaties of domeinen. Geen uitleg.\n\n" + prompt
-            )
+            "content": "Beantwoord de volgende vraag kort en concreet, in maximaal 3 zinnen. "
+                       "Noem alleen bedrijven, merknamen, locaties of domeinen. Geen uitleg.\n\n" + prompt
         }],
     }
     try:
-        r = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=(10, PERPLEXITY_HTTP_TIMEOUT),
-        )
+        r = requests.post("https://api.perplexity.ai/chat/completions", headers=headers, json=payload,
+                          timeout=(10, PERPLEXITY_HTTP_TIMEOUT))
     except requests.Timeout:
         log.warning("Perplexity timeout")
         return "__ERR timeout" if return_errors else None
@@ -251,25 +249,15 @@ def vraag_perplexity(prompt: str, return_errors: bool = False):
         log.warning("Perplexity parse-fout: %s; body=%s", e, r.text[:200])
         return (f"__ERR parse: {e}") if return_errors else None
 
-
 def check_bedrijfsvermelding(antwoord: str, bedrijfsnaam: str, domeinnaam: str | None = None) -> bool:
     if not antwoord:
         return False
     t = antwoord.lower()
     return (bedrijfsnaam and bedrijfsnaam.lower() in t) or (domeinnaam and domeinnaam.lower() in t)
 
-
-def run_vindbaarheidsscan(
-    bedrijfsnaam: str,
-    description: str,
-    locatie: str,
-    domeinnaam: str | None,
-    n: int = 10,
-    collect: bool = False,
-    language: str | None = None,
-    biz_type: str | None = None,
-):
-    """Als collect=True, retourneer (score, items) met Q&A."""
+def run_vindbaarheidsscan(bedrijfsnaam: str, description: str, locatie: str, domeinnaam: str | None,
+                          n: int = 10, collect: bool = False, language: str | None = None,
+                          biz_type: str | None = None):
     try:
         n = int(n)
     except Exception:
@@ -277,7 +265,6 @@ def run_vindbaarheidsscan(
     n = max(1, min(n, DEFAULT_MAX_N))
 
     start_ts = time.time()
-
     vragen = genereer_zoekvragen(description, locatie, n=n, language=language, biz_type=biz_type)
     if not vragen:
         return 0 if not collect else (0, [])
@@ -287,7 +274,6 @@ def run_vindbaarheidsscan(
     processed = 0
 
     for vraag in vragen:
-        # Respecteer totaalbudget
         if time.time() - start_ts > MAX_SCAN_SECONDS:
             log.info("Time budget reached; stopping early after %d/%d vragen", processed, len(vragen))
             break
@@ -307,34 +293,25 @@ def run_vindbaarheidsscan(
     score = round((hits / total) * 100)
     return score if not collect else (score, items)
 
-
-# --------------- API ----------------
+# --------------- API: basics ----------------
 @app.route("/", methods=["GET"])
 def root():
     return "scanner up", 200
-
 
 @app.route("/ping", methods=["GET"])
 def ping():
     return "ok", 200
 
-
+# --------------- /scan ----------------
 @app.route("/scan", methods=["POST", "OPTIONS"])
-@cross_origin(
-    origins=ALLOWED_ORIGINS or ["*"],
-    methods=["POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
-)
+@cross_origin(origins=ALLOWED_ORIGINS or ["*"], methods=["POST", "OPTIONS"], allow_headers=["Content-Type"])
 def scan():
-    # Preflight (CORS)
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # JSON of form-encoded accepteren
     data = (request.get_json(silent=True) or request.form.to_dict() or {})
     log.info("DEBUG /scan incoming: %s", data)
 
-    # ✅ reCAPTCHA: verplicht token + verificatie vóór verdere verwerking
     recaptcha_token = (data.get("recaptcha_token") or "").strip()
     if not recaptcha_token:
         return jsonify({"error": "missing recaptcha_token"}), 400
@@ -350,11 +327,10 @@ def scan():
     website_url  = (data.get("website_url") or "").strip()
     email        = (data.get("email")       or "").strip() or None
     language     = (data.get("language")    or "").strip() or None
-    biz_type     = (data.get("biz_type")    or "").strip().lower() or None  # "online" | "physical"
+    biz_type     = (data.get("biz_type")    or "").strip().lower() or None
 
-    domein = (
-        website_url.replace("https://", "").replace("http://", "").replace("/", "").lower()
-    ) if website_url else None
+    domein = (website_url.replace("https://", "").replace("http://", "").replace("/", "").lower()
+              ) if website_url else None
 
     try:
         n = int(data.get("n", DEFAULT_MAX_N))
@@ -364,25 +340,13 @@ def scan():
 
     return_details = bool(data.get("return_details") or data.get("debug"))
 
-    # Validate overige velden
     missing = []
     if not bedrijfsnaam: missing.append("company_name")
     if not description:  missing.append("description")
     if not locatie:      missing.append("location")
     if not email:        missing.append("email")
     if missing:
-        return jsonify({
-            "error": "missing required fields",
-            "missing": missing,
-            "received": {
-                "company_name": bedrijfsnaam,
-                "description": description,
-                "location": locatie,
-                "website_url": website_url,
-                "email": email,
-                "biz_type": biz_type
-            }
-        }), 400
+        return jsonify({"error": "missing required fields", "missing": missing}), 400
 
     if return_details:
         score, items = run_vindbaarheidsscan(
@@ -397,16 +361,15 @@ def scan():
         save_scan_to_db(bedrijfsnaam, website_url, description, locatie, language, score, email)
         return jsonify({"score": score}), 200
 
-
 @app.route("/scans", methods=["GET"])
 def list_scans():
-    """Geef alle scans terug als JSON."""
     if not ENGINE:
         return jsonify({"error": "Database niet geconfigureerd"}), 500
     try:
         with ENGINE.connect() as conn:
             result = conn.execute(text(
-                "SELECT id, created_at, name, website_url, description, location, language, score, email FROM scans ORDER BY created_at DESC"
+                "SELECT id, created_at, name, website_url, description, location, language, score, email "
+                "FROM scans ORDER BY created_at DESC"
             ))
             rows = [dict(r) for r in result.mappings()]
         return jsonify(rows), 200
@@ -414,14 +377,13 @@ def list_scans():
         log.exception("Fout bij ophalen scans: %s", e)
         return jsonify({"error": "DB query failed"}), 500
 
-
 # --------------- CONTACT: mail via Zoho SMTP ---------------
 def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None):
     if not (SMTP_USER and SMTP_PASS):
         raise RuntimeError("SMTP credentials missing")
     msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = formataddr(("ASEO Contact", SMTP_USER))
+    msg["From"] = formataddr(("ASEO", SMTP_USER))
     msg["To"] = CONTACT_TO
     if reply_to:
         msg["Reply-To"] = reply_to
@@ -431,30 +393,16 @@ def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None
         s.sendmail(SMTP_USER, [CONTACT_TO], msg.as_string())
 
 @app.route("/contact", methods=["POST", "OPTIONS"])
-@cross_origin(
-    origins=ALLOWED_ORIGINS or ["*"],
-    methods=["POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
-)
+@cross_origin(origins=ALLOWED_ORIGINS or ["*"], methods=["POST", "OPTIONS"], allow_headers=["Content-Type"])
 def contact():
-    # Preflight
     if request.method == "OPTIONS":
         return ("", 204)
-
     data = (request.get_json(silent=True) or {})
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip()
     message = (data.get("message") or "").strip()
-
     if not (name and email and message):
         return jsonify({"error": "missing fields"}), 400
-
-    # (Optioneel) reCAPTCHA voor contact:
-    # token = (data.get("recaptcha_token") or "").strip()
-    # if not token: return jsonify({"error": "missing recaptcha_token"}), 400
-    # ok,_ = verify_recaptcha(token, request.headers.get("X-Forwarded-For", request.remote_addr))
-    # if not ok: return jsonify({"error": "failed_recaptcha"}), 403
-
     subj = f"New contact form message from {name}"
     body = f"""
       <h3>New contact message</h3>
@@ -463,7 +411,6 @@ def contact():
       <p style="white-space:pre-wrap">{message}</p>
       <hr><p>Sent from aseon.io/contact</p>
     """
-
     try:
         send_mail_via_zoho(subj, body, reply_to=email)
         return jsonify({"ok": True}), 200
@@ -471,7 +418,148 @@ def contact():
         log.exception("contact send failed: %s", e)
         return jsonify({"error": "email_failed"}), 500
 
+# --------------- STRIPE WEBHOOK ----------------
+def _safe(d, *path, default=None):
+    cur = d or {}
+    for p in path:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return default
+    return cur
 
+def _email_payment_summary(title: str, payload: dict):
+    """
+    Bouwt een nette HTML mail voor betalingen/subscriptions.
+    """
+    lines = []
+    kv = [
+        ("Event", payload.get("event_type")),
+        ("Mode", payload.get("mode")),
+        ("Status", payload.get("status")),
+        ("Subscription", "yes" if payload.get("is_subscription") else "no"),
+        ("Plan", payload.get("plan") or "-"),
+        ("Amount", f"{(payload.get('amount_total') or 0)/100:.2f} {payload.get('currency','').upper()}"),
+        ("Customer", f"{payload.get('customer_name') or ''} ({payload.get('customer_email') or '-'})"),
+        ("Stripe event id", payload.get("event_id")),
+    ]
+    for k, v in kv:
+        lines.append(f"<tr><td style='padding:4px 8px'><b>{k}</b></td><td style='padding:4px 8px'>{v}</td></tr>")
+    return f"""
+      <h3>{title}</h3>
+      <table cellpadding="0" cellspacing="0" border="0">{''.join(lines)}</table>
+      <hr>
+      <small>Automatische notificatie · ASEO</small>
+    """
+
+@app.route("/webhook/stripe", methods=["POST"])
+def stripe_webhook():
+    if not STRIPE_WEBHOOK_SECRET:
+        log.error("STRIPE_WEBHOOK_SECRET missing")
+        return ("", 500)
+
+    payload = request.data
+    sig = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        log.warning("Stripe signature verification failed")
+        return ("", 400)
+    except ValueError:
+        log.warning("Invalid payload")
+        return ("", 400)
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+    log.info("Stripe event: %s", etype)
+
+    # Defaults
+    mode = _safe(obj, "mode")
+    status = _safe(obj, "status") or _safe(obj, "payment_status")
+    customer_email = _safe(obj, "customer_details", "email") or _safe(obj, "customer_email")
+    customer_name  = _safe(obj, "customer_details", "name")
+    plan = (_safe(obj, "metadata", "plan")
+            or _safe(obj, "metadata", "product")
+            or _safe(obj, "subscription_details", "metadata", "plan"))
+    amount_total = _safe(obj, "amount_total")
+    currency = _safe(obj, "currency")
+    is_sub = (mode == "subscription") or ("subscription" in etype)
+
+    # Per event bijsturen waar nodig
+    if etype.startswith("invoice."):
+        mode = "subscription"
+        is_sub = True
+        customer_email = _safe(obj, "customer_email") or customer_email
+        amount_total = _safe(obj, "total") or amount_total
+        currency = _safe(obj, "currency") or currency
+        status = _safe(obj, "status") or status
+        # vaak is plannaam via lines -> data[0] -> price -> nickname/product metadata
+        try:
+            line = (obj.get("lines", {}).get("data") or [])[0]
+            plan = _safe(line, "price", "nickname") or plan
+        except Exception:
+            pass
+
+    # payment_intent.succeeded (fallback, zelden nodig met Checkout)
+    if etype == "payment_intent.succeeded":
+        amount_total = _safe(obj, "amount_received") or _safe(obj, "amount")
+        currency = _safe(obj, "currency") or currency
+        status = "succeeded"
+
+    # Wegschrijven
+    save_payment_event(
+        event_id=event["id"],
+        event_type=etype,
+        mode=mode,
+        status=status,
+        is_subscription=bool(is_sub),
+        customer_email=customer_email,
+        customer_name=customer_name,
+        plan=plan,
+        amount_total=amount_total,
+        currency=currency,
+        raw=event
+    )
+
+    # E-mail notificaties (alleen voor key momenten)
+    try:
+        if etype in (
+            "checkout.session.completed",
+            "invoice.paid",
+            "invoice.payment_failed",
+            "customer.subscription.created",
+            "customer.subscription.updated",
+            "customer.subscription.deleted",
+            "payment_intent.succeeded",
+        ):
+            title_map = {
+                "checkout.session.completed": "✅ Checkout completed",
+                "invoice.paid": "✅ Subscription invoice paid",
+                "invoice.payment_failed": "❌ Subscription payment failed",
+                "customer.subscription.created": "🟢 Subscription created",
+                "customer.subscription.updated": "✏️ Subscription updated",
+                "customer.subscription.deleted": "🔴 Subscription canceled",
+                "payment_intent.succeeded": "✅ Payment intent succeeded",
+            }
+            summary = dict(
+                event_id=event["id"],
+                event_type=etype,
+                mode=mode,
+                status=status,
+                is_subscription=bool(is_sub),
+                customer_email=customer_email,
+                customer_name=customer_name,
+                plan=plan,
+                amount_total=amount_total,
+                currency=currency,
+            )
+            send_mail_via_zoho(title_map.get(etype, "Stripe event"), _email_payment_summary(title_map.get(etype, etype), summary))
+    except Exception as e:
+        log.exception("Stripe mail notify failed: %s", e)
+
+    return jsonify({"received": True})
+
+# --------------- Main ----------------
 if __name__ == "__main__":
     # Local dev — Render gebruikt gunicorn in productie
     app.run(host="0.0.0.0", port=5000)
