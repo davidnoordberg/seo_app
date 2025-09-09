@@ -40,14 +40,14 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 if STRIPE_SECRET:
     stripe.api_key = STRIPE_SECRET
 
-# Checkout redirect urls
+# Checkout redirect urls (nieuwe defaults naar aseon.io)
 CHECKOUT_SUCCESS_URL = os.environ.get(
     "CHECKOUT_SUCCESS_URL",
-    "https://aseo-70fee3.webflow.io/thanks?session_id={CHECKOUT_SESSION_ID}",
+    "https://aseon.io/checkout-success?session_id={CHECKOUT_SESSION_ID}",
 )
 CHECKOUT_CANCEL_URL = os.environ.get(
     "CHECKOUT_CANCEL_URL",
-    "https://aseo-70fee3.webflow.io/subscription?canceled=1",
+    "https://aseon.io/checkout-cancel",
 )
 
 def _adapt_url_for_sqlalchemy(url: str) -> str:
@@ -69,8 +69,10 @@ SLEEP_FAST               = float(os.environ.get("SLEEP_FAST", "0.5"))
 
 # CORS
 ALLOWED_ORIGINS = [
-    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://aseo-70fee3.webflow.io").split(",")
-    if o.strip()
+    o.strip() for o in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "https://aseon.io,https://aseo-9118b8.webflow.io,https://aseo-70fee3.webflow.io"
+    ).split(",") if o.strip()
 ]
 
 # OpenAI client
@@ -82,15 +84,17 @@ CORS(app, resources={
     r"/contact": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
     r"/ping": {"origins": "*"},
     r"/checkout/start": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["POST", "OPTIONS"], "allow_headers": ["Content-Type"]},
+    r"/checkout/session": {"origins": ALLOWED_ORIGINS or ["*"], "methods": ["GET", "OPTIONS"], "allow_headers": ["Content-Type"]},
     r"/webhook/stripe": {"origins": "*"},
 })
 
-# ---------- Stripe plan config (uses your PRODUCT ids + EUR amounts) ----------
+# ---------- Stripe plan config ----------
+# Bedragen in eurocenten. Yearly = ~17% korting t.o.v. 12x monthly.
 PLAN_CONFIG = {
-    "basic":    {"product": "prod_SzJLEa6TFnCBvC",   "amount": 17900, "interval": "month", "name": "Basic"},
-    "standard": {"product": "prod_SzJMgfOwJCIA44",   "amount": 34900, "interval": "month", "name": "Standard"},
-    "premium":  {"product": "prod_SzJNSVZi2ow0od",   "amount": 59900, "interval": "month", "name": "Premium"},
-    "boost":    {"product": "prod_SzJOgIxi9e0OLZ",   "amount": 84900, "interval": None,    "name": "Boost"},
+    "basic":    {"product": "prod_SzJLEa6TFnCBvC", "amount": 25000, "year_amount": 250000, "interval": "month", "name": "Basic"},
+    "standard": {"product": "prod_SzJMgfOwJCIA44", "amount": 40000, "year_amount": 400000, "interval": "month", "name": "Standard"},
+    "premium":  {"product": "prod_SzJNSVZi2ow0od", "amount": 80000, "year_amount": 800000, "interval": "month", "name": "Premium"},
+    "boost":    {"product": "prod_SzJOgIxi9e0OLZ", "amount": 84900, "interval": None,      "name": "Boost"},
 }
 CURRENCY = "eur"
 
@@ -444,7 +448,6 @@ def send_mail_via_zoho(subject: str, html_body: str, reply_to: str | None = None
     to_addr = to_addr or CONTACT_TO
     msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = subject
-    # From-naam op "Aseon"
     msg["From"] = formataddr(("Aseon", SMTP_USER))
     msg["To"] = to_addr
     if reply_to:
@@ -496,6 +499,7 @@ def checkout_start():
 
     # Fields from frontend form
     plan_key    = (data.get("plan") or "basic").strip().lower()
+    billing     = (data.get("billing") or "monthly").strip().lower()  # 'monthly' | 'yearly'
     full_name   = (data.get("name") or "").strip()
     company     = (data.get("company") or "").strip()
     email       = (data.get("email") or "").strip()
@@ -508,14 +512,21 @@ def checkout_start():
     plan_cfg = PLAN_CONFIG[plan_key]
     mode = "subscription" if plan_cfg["interval"] else "payment"
 
+    # Bepaal bedrag + interval o.b.v. billing
+    chosen_amount = plan_cfg["amount"]
+    interval = plan_cfg.get("interval")
+    if mode == "subscription" and billing == "yearly":
+        chosen_amount = plan_cfg.get("year_amount") or (plan_cfg["amount"] * 12)
+        interval = "year"
+
     # Build line item using existing product ids + ad-hoc price_data
     price_data = {
         "currency": CURRENCY,
         "product": plan_cfg["product"],
-        "unit_amount": plan_cfg["amount"],
+        "unit_amount": chosen_amount,
     }
     if mode == "subscription":
-        price_data["recurring"] = {"interval": plan_cfg["interval"]}
+        price_data["recurring"] = {"interval": interval}
 
     try:
         session = stripe.checkout.Session.create(
@@ -531,6 +542,7 @@ def checkout_start():
             metadata={
                 "plan": plan_cfg["name"],
                 "plan_key": plan_key,
+                "billing": billing,
                 "form_name": full_name,
                 "company_name": company,
                 "competitors": competitors,
@@ -539,7 +551,7 @@ def checkout_start():
             allow_promotion_codes=True,
         )
 
-        # Save immediately for Beekeeper visibility even before webhook
+        # Save immediately for visibility even before webhook
         save_checkout_session(
             session_id=session["id"],
             customer_email=email,
@@ -548,7 +560,7 @@ def checkout_start():
             competitors=competitors,
             notes=notes,
             plan=plan_cfg["name"],
-            amount_total=plan_cfg["amount"],
+            amount_total=chosen_amount,
             currency=CURRENCY,
             raw={"local": "created_via_checkout_start"}
         )
@@ -669,7 +681,11 @@ def stripe_webhook():
                          or plan
                          or "Aseon plan")
 
-            cadence = "monthly subscription" if sess.get("mode") == "subscription" else "one-time purchase"
+            if sess.get("mode") == "subscription":
+                billing_meta = (meta.get("billing") or "").lower()
+                cadence = "yearly subscription" if billing_meta == "yearly" else "monthly subscription"
+            else:
+                cadence = "one-time purchase"
 
             save_checkout_session(
                 session_id=session_id,
@@ -684,7 +700,7 @@ def stripe_webhook():
                 raw=event
             )
 
-            # --- Confirmation email (GEO wording, simple promise) ---
+            # --- Confirmation email ---
             if customer_email:
                 first_name = (customer_name or "").split(" ")[0] or "there"
                 subject_user = f"Welcome to Aseon — your {plan_name} ({cadence}) is confirmed"
@@ -715,6 +731,44 @@ def stripe_webhook():
             log.exception("Error handling checkout.session.completed: %s", e)
 
     return jsonify({"received": True})
+
+# --------- Public endpoint voor de success-pagina ----------
+@app.route("/checkout/session", methods=["GET", "OPTIONS"])
+@cross_origin(origins=ALLOWED_ORIGINS or ["*"], methods=["GET", "OPTIONS"], allow_headers=["Content-Type"])
+def checkout_session():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not STRIPE_SECRET:
+        return jsonify({"error": "Stripe not configured"}), 500
+    session_id = (request.args.get("session_id") or "").strip()
+    if not session_id:
+        return jsonify({"error": "missing session_id"}), 400
+    try:
+        sess = stripe.checkout.Session.retrieve(session_id, expand=["line_items", "payment_intent"])
+        line_items = (sess.get("line_items") or {}).get("data", [])
+        item = line_items[0] if line_items else {}
+        plan_name = (item.get("description")
+                     or _safe(item, "price", "nickname")
+                     or _safe(sess, "metadata", "plan")
+                     or "Aseon plan")
+        data = {
+            "id": sess.get("id"),
+            "mode": sess.get("mode"),
+            "status": sess.get("status") or sess.get("payment_status"),
+            "amount_total": sess.get("amount_total"),
+            "currency": sess.get("currency"),
+            "customer": {
+                "email": _safe(sess, "customer_details", "email") or sess.get("customer_email"),
+                "name": _safe(sess, "customer_details", "name"),
+            },
+            "plan": plan_name,
+            "billing": _safe(sess, "metadata", "billing") or ("yearly" if _safe(item, "price", "recurring", "interval") == "year" else "monthly"),
+            "created": sess.get("created"),
+        }
+        return jsonify(data), 200
+    except Exception as e:
+        log.exception("Failed to retrieve session %s: %s", session_id, e)
+        return jsonify({"error": "not_found"}), 404
 
 # --------------- Main ----------------
 if __name__ == "__main__":
